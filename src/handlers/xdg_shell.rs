@@ -24,6 +24,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::input_method::InputMethodSeat;
+use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::kde::decoration::{KdeDecorationHandler, KdeDecorationState};
 use smithay::wayland::shell::wlr_layer::{self, Layer};
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
@@ -41,7 +42,7 @@ use crate::input::move_grab::MoveGrab;
 use crate::input::resize_grab::ResizeGrab;
 use crate::input::touch_resize_grab::TouchResizeGrab;
 use crate::input::{PointerOrTouchStartData, DOUBLE_CLICK_TIME};
-use crate::layout::ActivateWindow;
+use crate::layout::{ActivateWindow, LayoutElement};
 use crate::niri::{CastTarget, PopupGrabState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{
@@ -71,6 +72,10 @@ impl XdgShellHandler for State {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, _seat: WlSeat, serial: Serial) {
+        // Preview content drags belong to the client, never to compositor move/resize.
+        if crate::input::overview_client_grab::OverviewClientGrab::is_active(self) {
+            return;
+        }
         let wl_surface = surface.wl_surface();
 
         let mut grab_start_data = None;
@@ -155,6 +160,9 @@ impl XdgShellHandler for State {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
+        if crate::input::overview_client_grab::OverviewClientGrab::is_active(self) {
+            return;
+        }
         let wl_surface = surface.wl_surface();
 
         let mut grab_start_data = None;
@@ -272,6 +280,18 @@ impl XdgShellHandler for State {
             trace!("ignoring popup grab because no root surface");
             return;
         };
+
+        // A native popup grab includes keyboard focus. Fit preview input is pointer-only;
+        // dismiss these menus instead of replacing overview's keyboard owner or drag grab.
+        if self.niri.layout.is_overview_open()
+            && self.niri.config.borrow().overview.mode == niri_config::OverviewMode::Fit
+            && self.niri.layout.windows().any(|(_, w)| {
+                w.rules().overview_interactive && w.window.wl_surface().as_deref() == Some(&root)
+            })
+        {
+            let _ = PopupManager::dismiss_popup(&root, &popup);
+            return;
+        }
 
         // We need to hand out the grab in a way consistent with what update_keyboard_focus()
         // thinks the current focus is, otherwise it will desync and cause weird issues with
@@ -1123,7 +1143,6 @@ impl State {
 
         let mut is_pending_maximized = false;
         if let Some(ws) = ws {
-            // Set a fullscreen and maximized state based on window request and window rule.
             is_pending_maximized = (*wants_maximized && rules.open_maximized_to_edges.is_none())
                 || rules.open_maximized_to_edges == Some(true);
 

@@ -15,8 +15,8 @@ use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
 use niri_config::{
-    Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
-    WorkspaceReference, Xkb,
+    Config, FloatOrInt, Key, Modifiers, OutputName, OverviewMode, TrackLayout,
+    WarpMouseToFocusMode, WorkspaceReference, Xkb,
 };
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
@@ -169,8 +169,10 @@ use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
+use crate::ui::overview_controls::{OverviewControls, OverviewControlsRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
+use crate::ui::workspace_preview::{WorkspacePreview, WorkspacePreviewRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
 use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
 use crate::utils::vblank_throttle::VBlankThrottle;
@@ -190,6 +192,8 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+const OVERVIEW_MOUSE_CAMERA_THRESHOLD: f64 = 160.;
+const WORKSPACE_MOUSE_CAMERA_THRESHOLD: f64 = 160.;
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -368,6 +372,15 @@ pub struct Niri {
     /// resolution mice.
     pub notified_activity_this_iteration: bool,
     pub pointer_inside_hot_corner: bool,
+    pub overview_mouse_camera_active: bool,
+    pub overview_mouse_camera_accum: Point<f64, Logical>,
+    pub workspace_mouse_camera_active: bool,
+    pub workspace_mouse_camera_button: Option<u32>,
+    pub workspace_mouse_camera_accum: Point<f64, Logical>,
+    pub workspace_mouse_camera_recenter_on_release: bool,
+    pub workspace_mouse_camera_origin_window: Option<Window>,
+    pub workspace_mouse_camera_target_window: Option<Window>,
+    pub workspace_mouse_camera_cursor_image: Option<CursorImageStatus>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
@@ -385,6 +398,8 @@ pub struct Niri {
     pub locked_hint: Option<bool>,
 
     pub screenshot_ui: ScreenshotUi,
+    pub overview_controls: OverviewControls,
+    pub workspace_preview: WorkspacePreview,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
@@ -1021,6 +1036,12 @@ impl State {
 
     pub fn refresh_pointer_contents(&mut self) {
         let _span = tracy_client::span!("Niri::refresh_pointer_contents");
+        // Grabs need lifecycle/cancellation checks even with an unmoving pointer, unchanged
+        // contents, or a running close animation.
+        if crate::input::overview_client_grab::OverviewClientGrab::is_active(self) {
+            let pointer = self.niri.seat.get_pointer().unwrap();
+            pointer.frame(self);
+        }
 
         let pointer = &self.niri.seat.get_pointer().unwrap();
         let location = pointer.current_location();
@@ -1029,10 +1050,14 @@ impl State {
             && !self.niri.is_locked()
             && !self.niri.screenshot_ui.is_open()
         {
-            // Don't refresh cursor focus during transitions.
+            // Fit previews have an inverse transform for the displayed camera, so their hover
+            // must track animations too. Keep the old transition policy everywhere else.
             if let Some((output, _)) = self.niri.output_under(location) {
                 let monitor = self.niri.layout.monitor_for_output(output).unwrap();
-                if monitor.are_transitions_ongoing() {
+                if monitor.are_transitions_ongoing()
+                    && !(self.niri.layout.is_overview_open()
+                        && self.niri.config.borrow().overview.mode == OverviewMode::Fit)
+                {
                     return;
                 }
             }
@@ -1100,6 +1125,244 @@ impl State {
     pub fn move_cursor_to_output(&mut self, output: &Output) {
         let geo = self.niri.global_space.output_geometry(output).unwrap();
         self.move_cursor(center(geo).to_f64());
+    }
+
+    pub fn overview_uses_mouse_camera(&self) -> bool {
+        self.niri.config.borrow().overview.mode == OverviewMode::Scrolling
+    }
+
+    pub fn start_overview_mouse_camera(&mut self) {
+        self.niri.overview_mouse_camera_active = true;
+        self.niri.overview_mouse_camera_accum = Point::default();
+
+        if let Some(output) = self.niri.layout.active_output().cloned() {
+            self.move_cursor_to_output(&output);
+        }
+
+        self.niri.pointer_visibility = PointerVisibility::Hidden;
+        self.niri.tablet_cursor_location = None;
+        self.niri.queue_redraw_all();
+    }
+
+    pub fn stop_overview_mouse_camera(&mut self) {
+        if self.niri.overview_mouse_camera_active {
+            self.niri.overview_mouse_camera_active = false;
+            self.niri.overview_mouse_camera_accum = Point::default();
+            self.niri.pointer_visibility = PointerVisibility::Visible;
+
+            // Overview keeps the physical pointer at the output center while focus moves between
+            // columns. Put it inside the selected tile before normal pointer handling resumes, or
+            // unrestricted focus-follows-mouse can reactivate a different window at that point.
+            if !self.move_cursor_to_focused_tile(CenterCoords::BothAlways) {
+                if let Some(output) = self.niri.layout.active_output().cloned() {
+                    self.move_cursor_to_output(&output);
+                }
+            }
+
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    pub fn sync_overview_mouse_camera(&mut self) {
+        if self.niri.layout.is_overview_open() && self.overview_uses_mouse_camera() {
+            if !self.niri.overview_mouse_camera_active {
+                self.start_overview_mouse_camera();
+            } else if self.niri.pointer_visibility.is_visible() {
+                self.niri.pointer_visibility = PointerVisibility::Hidden;
+                self.niri.tablet_cursor_location = None;
+                self.niri.queue_redraw_all();
+            }
+        } else {
+            self.stop_overview_mouse_camera();
+            if self.niri.layout.is_overview_open() && !self.niri.pointer_visibility.is_visible() {
+                self.niri.pointer_visibility = PointerVisibility::Visible;
+                self.niri.tablet_cursor_location = None;
+                self.niri.queue_redraw_all();
+            }
+        }
+    }
+
+    pub fn handle_overview_mouse_camera_motion(&mut self, delta: Point<f64, Logical>) {
+        self.niri.overview_mouse_camera_accum += delta;
+        let movement = self.niri.overview_mouse_camera_accum;
+
+        if movement.x.abs().max(movement.y.abs()) < OVERVIEW_MOUSE_CAMERA_THRESHOLD {
+            return;
+        }
+
+        if movement.x.abs() > movement.y.abs() {
+            if movement.x > 0. {
+                self.niri.layout.focus_right();
+            } else {
+                self.niri.layout.focus_left();
+            }
+        } else if movement.y > 0. {
+            self.niri.layout.switch_workspace_down();
+        } else {
+            self.niri.layout.switch_workspace_up();
+        }
+
+        self.niri.overview_mouse_camera_accum = Point::default();
+        self.niri.layer_shell_on_demand_focus = None;
+        self.niri.queue_redraw_all();
+
+        if let Some(output) = self.niri.layout.active_output().cloned() {
+            self.move_cursor_to_output(&output);
+        }
+    }
+
+    pub fn start_workspace_mouse_camera(&mut self) {
+        let origin_window = self
+            .workspace_mouse_camera_window_under_final_cursor()
+            .or_else(|| self.niri.layout.focus().map(|window| window.window.clone()));
+
+        if !self.niri.workspace_mouse_camera_active {
+            self.niri.workspace_mouse_camera_cursor_image =
+                Some(self.niri.cursor_manager.cursor_image().clone());
+        }
+
+        self.niri.workspace_mouse_camera_active = true;
+        self.niri.workspace_mouse_camera_accum = Point::default();
+        self.niri.workspace_mouse_camera_recenter_on_release = false;
+        self.niri.workspace_mouse_camera_origin_window = origin_window;
+        self.niri.workspace_mouse_camera_target_window = None;
+        self.niri.pointer_visibility = PointerVisibility::Visible;
+        self.niri.tablet_cursor_location = None;
+
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(CursorIcon::Grabbing));
+        if let Some(output) = self.niri.layout.active_output().cloned() {
+            self.niri.workspace_preview.open(&self.niri.layout, output);
+        }
+
+        self.niri.queue_redraw_all();
+    }
+
+    pub fn stop_workspace_mouse_camera(&mut self) {
+        if self.niri.workspace_mouse_camera_active {
+            let overview_open = self.niri.layout.is_overview_open();
+            let moved_horizontally = self.niri.workspace_mouse_camera_recenter_on_release;
+            let hovered_window = self.workspace_mouse_camera_window_under_final_cursor();
+            let origin_window = self.niri.workspace_mouse_camera_origin_window.take();
+            let target_window = self.niri.workspace_mouse_camera_target_window.take();
+            let pointer_reached_new_window =
+                hovered_window.is_some() && hovered_window.as_ref() != origin_window.as_ref();
+            let recenter = moved_horizontally && !pointer_reached_new_window && !overview_open;
+
+            self.niri.workspace_mouse_camera_active = false;
+            self.niri.workspace_mouse_camera_accum = Point::default();
+            self.niri.workspace_mouse_camera_recenter_on_release = false;
+            self.niri.pointer_visibility = if overview_open {
+                PointerVisibility::Hidden
+            } else {
+                PointerVisibility::Visible
+            };
+            self.niri.cursor_manager.set_cursor_image(
+                self.niri
+                    .workspace_mouse_camera_cursor_image
+                    .take()
+                    .unwrap_or_else(CursorImageStatus::default_named),
+            );
+
+            if recenter {
+                if let Some(target_window) = target_window {
+                    self.niri.layout.activate_window(&target_window);
+                }
+
+                if !self.move_cursor_to_focused_tile(CenterCoords::BothAlways) {
+                    if let Some(output) = self.niri.layout.active_output().cloned() {
+                        self.move_cursor_to_output(&output);
+                    }
+                }
+            }
+            self.niri.workspace_preview.close();
+
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    pub fn sync_workspace_mouse_camera(&mut self) {
+        let overview_open = self.niri.layout.is_overview_open();
+        if overview_open {
+            self.niri.workspace_preview.hide();
+        } else if self.niri.workspace_mouse_camera_active {
+            if let Some(output) = self.niri.layout.active_output().cloned() {
+                self.niri.workspace_preview.open(&self.niri.layout, output);
+            }
+            self.niri.pointer_visibility = PointerVisibility::Visible;
+            self.niri.tablet_cursor_location = None;
+            self.niri
+                .cursor_manager
+                .set_cursor_image(CursorImageStatus::Named(CursorIcon::Grabbing));
+            self.niri.queue_redraw_all();
+        }
+    }
+
+    fn workspace_mouse_camera_window_under_final_cursor(&self) -> Option<Window> {
+        let pointer = self.niri.seat.get_pointer().unwrap();
+        let (output, pos_within_output) = self.niri.output_under(pointer.current_location())?;
+        let monitor = self.niri.layout.monitor_for_output(output)?;
+        monitor
+            .active_workspace_ref()
+            .window_under_at_final_view(pos_within_output)
+            .map(|window| window.window.clone())
+    }
+
+    pub fn handle_workspace_mouse_camera_motion(&mut self, delta: Point<f64, Logical>) {
+        self.niri.workspace_mouse_camera_accum += delta;
+        let movement = self.niri.workspace_mouse_camera_accum;
+
+        if movement.x.abs().max(movement.y.abs()) < WORKSPACE_MOUSE_CAMERA_THRESHOLD {
+            return;
+        }
+
+        // Treat mouse travel as dragging the desktop canvas: moving the mouse right exposes the
+        // column to the left, and moving it down exposes the workspace above.
+        let moved_horizontally = if movement.x.abs() > movement.y.abs() {
+            let focus_before = self.niri.layout.focus().map(|win| win.window.clone());
+            if movement.x > 0. {
+                self.niri.layout.focus_left();
+            } else {
+                self.niri.layout.focus_right();
+            }
+
+            let focus_after = self.niri.layout.focus().map(|win| win.window.clone());
+            if focus_before != focus_after {
+                self.niri.workspace_mouse_camera_recenter_on_release = true;
+                self.niri.workspace_mouse_camera_target_window = focus_after;
+            }
+            self.niri.workspace_preview.sync(&self.niri.layout);
+
+            true
+        } else {
+            if movement.y > 0. {
+                self.niri.layout.switch_workspace_up();
+            } else {
+                self.niri.layout.switch_workspace_down();
+            }
+            self.niri.workspace_preview.sync(&self.niri.layout);
+
+            self.niri.workspace_mouse_camera_recenter_on_release = false;
+            self.niri.workspace_mouse_camera_target_window = None;
+            false
+        };
+
+        self.niri.workspace_mouse_camera_accum = Point::default();
+        self.niri.layer_shell_on_demand_focus = None;
+        self.niri.queue_redraw_all();
+
+        if !moved_horizontally {
+            if let Some(output) = self.niri.layout.active_output().cloned() {
+                self.move_cursor_to_output(&output);
+            }
+            self.niri.workspace_mouse_camera_origin_window =
+                self.workspace_mouse_camera_window_under_final_cursor();
+        }
+
+        self.niri
+            .cursor_manager
+            .set_cursor_image(CursorImageStatus::Named(CursorIcon::Grabbing));
     }
 
     pub fn refresh_popup_grab(&mut self) {
@@ -2417,6 +2680,8 @@ impl Niri {
         }
 
         let exit_confirm_dialog = ExitConfirmDialog::new(animation_clock.clone(), config.clone());
+        let workspace_preview = WorkspacePreview::new(animation_clock.clone(), config.clone());
+        let overview_controls = OverviewControls::new();
 
         #[cfg(feature = "dbus")]
         let a11y = A11y::new(event_loop.clone());
@@ -2579,6 +2844,15 @@ impl Niri {
             pointer_inactivity_timer_got_reset: false,
             notified_activity_this_iteration: false,
             pointer_inside_hot_corner: false,
+            overview_mouse_camera_active: false,
+            overview_mouse_camera_accum: Point::default(),
+            workspace_mouse_camera_active: false,
+            workspace_mouse_camera_button: None,
+            workspace_mouse_camera_accum: Point::default(),
+            workspace_mouse_camera_recenter_on_release: false,
+            workspace_mouse_camera_origin_window: None,
+            workspace_mouse_camera_target_window: None,
+            workspace_mouse_camera_cursor_image: None,
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
@@ -2596,9 +2870,11 @@ impl Niri {
             locked_hint: None,
 
             screenshot_ui,
+            overview_controls,
             config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
+            workspace_preview,
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -3265,6 +3541,49 @@ impl Niri {
         Some(window)
     }
 
+    pub fn overview_close_button(
+        &self,
+        output: &Output,
+    ) -> Option<(MappedId, Rectangle<f64, Logical>)> {
+        if !self.layout.is_overview_open()
+            || self.config.borrow().overview.mode != OverviewMode::Fit
+        {
+            return None;
+        }
+
+        let pointer = self.seat.get_pointer().unwrap().current_location();
+        let (pointer_output, pos_within_output) = self.output_under(pointer)?;
+        if pointer_output != output {
+            return None;
+        }
+        let (window, _) = self.layout.window_under(output, pos_within_output)?;
+        let window_rect = self.layout.window_visual_rect(output, &window.window)?;
+        let button = OverviewControls::button_rect(window_rect)?;
+        Some((window.id(), button))
+    }
+
+    pub fn overview_workspace_label(&self, output: &Output) -> Option<WorkspaceId> {
+        if !self.layout.is_overview_open()
+            || self.config.borrow().overview.mode != OverviewMode::Fit
+        {
+            return None;
+        }
+
+        let pointer = self.seat.get_pointer().unwrap().current_location();
+        let (pointer_output, pos_within_output) = self.output_under(pointer)?;
+        if pointer_output != output {
+            return None;
+        }
+        self.layout
+            .monitor_for_output(output)?
+            .overview_workspace_labels()
+            .find_map(|(workspace_id, _, top_left)| {
+                OverviewControls::workspace_label_rect(top_left)
+                    .contains(pos_within_output)
+                    .then_some(workspace_id)
+            })
+    }
+
     /// Returns the window under the cursor to be activated.
     ///
     /// The cursor may be inside the window's activation region, but not within the window's input
@@ -3323,6 +3642,9 @@ impl Niri {
             return rv;
         }
 
+        // Preview obstruction testing takes the layer-map mutex too. Resolve it before
+        // holding that mutex for normal render-order dispatch below.
+        let overview_target = self.overview_preview_target(pos);
         let layers = layer_map_for_output(output);
         let layer_surface_under = |layer, popup| {
             layers
@@ -3370,6 +3692,17 @@ impl Niri {
 
         let mapped_hit_data = |(mapped, hit): (&Mapped, HitType)| {
             let window = &mapped.window;
+            if self.layout.is_overview_open() {
+                if let Some(target) = overview_target.as_ref() {
+                    if target.window == *window {
+                        let (surface, origin) = target.focus(pos);
+                        return (
+                            Some((surface, origin - output_pos_in_global_space.to_f64())),
+                            (Some((window.clone(), hit)), None),
+                        );
+                    }
+                }
+            }
             let surface_and_pos = if let HitType::Input { win_pos } = hit {
                 let win_pos_within_output = win_pos;
                 window
@@ -4057,6 +4390,7 @@ impl Niri {
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
+        self.workspace_preview.advance_animations();
 
         for state in self.output_state.values_mut() {
             if let Some(transition) = &mut state.screen_transition {
@@ -4107,7 +4441,9 @@ impl Niri {
                 state.xray.workspaces.clear();
                 let mon = self.layout.monitor_for_output(out).unwrap();
                 for (ws, geo) in mon.workspaces_with_render_geo() {
-                    let bg_color = ws.render_background().color();
+                    let bg_color = ws
+                        .render_background(mon.workspace_overview_opacity(ws.id()))
+                        .color();
                     state.xray.workspaces.push((geo, bg_color));
                 }
                 state.xray.backdrop_color = state.backdrop_buffer.color();
@@ -4285,6 +4621,28 @@ impl Niri {
         // Then, the Alt-Tab switcher.
         self.window_mru_ui
             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+        if !self.layout.is_overview_open() {
+            self.workspace_preview
+                .render_output(ctx.renderer, output, ctx.target, &mut |elem| {
+                    push(OutputRenderElements::WorkspacePreview(elem));
+                });
+        }
+        if self.layout.is_overview_open() && self.config.borrow().overview.mode == OverviewMode::Fit
+        {
+            let monitor = self.layout.monitor_for_output(output).unwrap();
+            for (id, number, top_left) in monitor.overview_workspace_labels() {
+                self.overview_controls.render_workspace_label(
+                    number,
+                    top_left,
+                    monitor.workspace_overview_opacity(id),
+                    &mut |elem| push(elem.into()),
+                );
+            }
+        }
+        if let Some((_, button)) = self.overview_close_button(output) {
+            self.overview_controls
+                .render(button, &mut |elem| push(elem.into()));
+        }
 
         // Don't draw the focus ring on the workspaces while interactively moving above those
         // workspaces, since the interactively-moved window already has a focus ring.
@@ -4376,7 +4734,10 @@ impl Niri {
 
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
-                push(ws.render_background().into());
+                push(
+                    ws.render_background(mon.workspace_overview_opacity(ws.id()))
+                        .into(),
+                );
             }
         } else {
             push_popups_from_layer!(Layer::Top);
@@ -4421,7 +4782,7 @@ impl Niri {
                 push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
                 push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
 
-                process!(geo)(ws.render_background());
+                process!(geo)(ws.render_background(mon.workspace_overview_opacity(ws.id())));
             }
         }
 
@@ -4601,6 +4962,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
+            state.unfinished_animations_remain |= self.workspace_preview.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
@@ -6064,6 +6426,10 @@ impl Niri {
     ///
     /// Make sure the pointer location and contents are up to date before calling this.
     pub fn maybe_activate_pointer_constraint(&self) {
+        if self.layout.is_overview_open() && self.config.borrow().overview.mode == OverviewMode::Fit
+        {
+            return;
+        }
         let Some((surface, surface_loc)) = &self.pointer_contents.surface else {
             return;
         };
@@ -6173,6 +6539,16 @@ impl Niri {
     }
 
     pub fn handle_focus_follows_mouse(&mut self, new_focus: &PointContents) {
+        if self.layout.is_overview_open()
+            && self.config.borrow().overview.mode == OverviewMode::Fit
+            && new_focus.window.as_ref().is_some_and(|(window, _)| {
+                self.layout.windows().any(|(_, mapped)| {
+                    mapped.window == *window && mapped.rules().overview_interactive
+                })
+            })
+        {
+            return;
+        }
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
             return;
         };
@@ -6521,7 +6897,9 @@ niri_render_elements! {
         Wayland = WaylandSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
+        WorkspacePreview = WorkspacePreviewRenderElement<R>,
         WindowMruUi = WindowMruUiRenderElement<R>,
+        OverviewControls = OverviewControlsRenderElement,
         ExitConfirmDialog = ExitConfirmDialogRenderElement,
         Texture = PrimaryGpuTextureRenderElement,
         // Used for the CPU-rendered panels.

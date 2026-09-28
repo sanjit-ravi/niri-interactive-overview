@@ -81,6 +81,7 @@ pub mod focus_ring;
 pub mod insert_hint_element;
 pub mod monitor;
 pub mod opening_window;
+mod overview_camera;
 pub mod scrolling;
 pub mod shadow;
 pub mod tab_indicator;
@@ -647,6 +648,18 @@ impl HitType {
 }
 
 impl Options {
+    fn overview_animation(&self) -> niri_config::Animation {
+        let mut config = self.animations.overview_open_close.0;
+        if self.overview.mode == niri_config::OverviewMode::Fit {
+            config.kind =
+                niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
+                    duration_ms: 133,
+                    curve: niri_config::animations::Curve::Linear,
+                });
+        }
+        config
+    }
+
     fn from_config(config: &Config) -> Self {
         Self {
             layout: config.layout.clone(),
@@ -2332,6 +2345,29 @@ impl<W: LayoutElement> Layout<W> {
         mon.window_under(pos_within_output)
     }
 
+    /// Returns the topmost surface-input hit in a displayed fit-overview preview.
+    ///
+    /// The returned point is the displayed buffer origin, suitable for mapping output coordinates
+    /// into the window's `surface_under()` coordinates using the returned zoom.
+    pub fn overview_window_hit(
+        &self,
+        output: &Output,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, Point<f64, Logical>, f64)> {
+        self.monitor_for_output(output)?
+            .overview_window_hit(pos_within_output)
+    }
+
+    /// Returns the displayed buffer origin and scale of a visible fit-overview window.
+    pub fn overview_window_transform(
+        &self,
+        output: &Output,
+        window: &W::Id,
+    ) -> Option<(Point<f64, Logical>, f64)> {
+        self.monitor_for_output(output)?
+            .overview_window_transform(window)
+    }
+
     pub fn resize_edges_under(
         &self,
         output: &Output,
@@ -2363,8 +2399,17 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn overview_zoom(&self) -> f64 {
-        let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+        self.active_monitor_ref()
+            .map(Monitor::overview_zoom)
+            .unwrap_or(1.)
+    }
+
+    pub fn window_visual_rect(
+        &self,
+        output: &Output,
+        window: &W::Id,
+    ) -> Option<Rectangle<f64, Logical>> {
+        self.monitor_for_output(output)?.window_visual_rect(window)
     }
 
     #[cfg(test)]
@@ -2857,6 +2902,8 @@ impl<W: LayoutElement> Layout<W> {
 
         if let Some(mon) = self.monitor_for_output_mut(&move_.output) {
             let zoom = mon.overview_zoom();
+            let split_inside =
+                mon.overview_open && mon.options.overview.mode == niri_config::OverviewMode::Fit;
             let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
             match insert_ws {
                 InsertWorkspace::Existing(ws_id) => {
@@ -2870,7 +2917,7 @@ impl<W: LayoutElement> Layout<W> {
                     let position = if move_.is_floating {
                         InsertPosition::Floating
                     } else {
-                        ws.scrolling_insert_position(pos_within_workspace)
+                        ws.scrolling_insert_position(pos_within_workspace, split_inside)
                     };
 
                     let border_width = move_.tile.effective_border_width().unwrap_or(0.);
@@ -2883,6 +2930,7 @@ impl<W: LayoutElement> Layout<W> {
                         workspace: insert_ws,
                         position,
                         corner_radius,
+                        preview_tile_size: move_.tile.animated_tile_size(),
                     });
                 }
                 InsertWorkspace::NewAt(_) => {
@@ -2895,6 +2943,7 @@ impl<W: LayoutElement> Layout<W> {
                         workspace: insert_ws,
                         position,
                         corner_radius: CornerRadius::default(),
+                        preview_tile_size: move_.tile.animated_tile_size(),
                     });
                 }
             }
@@ -3782,7 +3831,7 @@ impl<W: LayoutElement> Layout<W> {
             gesture.value,
             new_value,
             velocity,
-            self.options.animations.overview_open_close.0,
+            self.options.overview_animation(),
         )));
 
         self.set_monitors_overview_state();
@@ -4128,6 +4177,10 @@ impl<W: LayoutElement> Layout<W> {
             return;
         }
 
+        // Resolve the final pointer against the same unexpanded layout used by
+        // the preview, before ending gestures changes workspace geometry.
+        self.update_insert_hint(None);
+
         let Some(InteractiveMoveState::Moving(mut move_)) = self.interactive_move.take() else {
             unreachable!()
         };
@@ -4159,58 +4212,76 @@ impl<W: LayoutElement> Layout<W> {
                 active_monitor_idx,
                 ..
             } => {
-                let (mon, insert_ws, position, offset, zoom) =
-                    if let Some(mon) = monitors.iter_mut().find(|mon| mon.output == move_.output) {
-                        let zoom = mon.overview_zoom();
+                let (mon, insert_ws, position, offset, zoom) = if let Some(mon) =
+                    monitors.iter_mut().find(|mon| mon.output == move_.output)
+                {
+                    let zoom = mon.overview_zoom();
+                    let split_inside = mon.overview_open
+                        && mon.options.overview.mode == niri_config::OverviewMode::Fit;
 
-                        let (insert_ws, geo) = mon.insert_position(move_.pointer_pos_within_output);
-                        let (position, offset) = match insert_ws {
-                            InsertWorkspace::Existing(ws_id) => {
-                                let ws_idx = mon
-                                    .workspaces
-                                    .iter_mut()
-                                    .position(|ws| ws.id() == ws_id)
-                                    .unwrap();
+                    let (mut insert_ws, mut geo) =
+                        mon.insert_position(move_.pointer_pos_within_output);
+                    let preview_position = mon.insert_hint.as_ref().map(|hint| {
+                        insert_ws = hint.workspace;
+                        hint.position
+                    });
+                    if let InsertWorkspace::Existing(id) = insert_ws {
+                        if let Some((_, resolved_geo)) = mon
+                            .workspaces_with_render_geo()
+                            .find(|(ws, _)| ws.id() == id)
+                        {
+                            geo = resolved_geo;
+                        }
+                    }
+                    let (position, offset) = match insert_ws {
+                        InsertWorkspace::Existing(ws_id) => {
+                            let ws_idx = mon
+                                .workspaces
+                                .iter_mut()
+                                .position(|ws| ws.id() == ws_id)
+                                .unwrap();
 
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    let pos_within_workspace =
-                                        (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
-                                    let ws = &mut mon.workspaces[ws_idx];
-                                    ws.scrolling_insert_position(pos_within_workspace)
-                                };
+                            let position = if move_.is_floating {
+                                InsertPosition::Floating
+                            } else {
+                                let pos_within_workspace =
+                                    (move_.pointer_pos_within_output - geo.loc).downscale(zoom);
+                                let ws = &mut mon.workspaces[ws_idx];
+                                preview_position.unwrap_or_else(|| {
+                                    ws.scrolling_insert_position(pos_within_workspace, split_inside)
+                                })
+                            };
 
-                                (position, Some(geo.loc))
-                            }
-                            InsertWorkspace::NewAt(_) => {
-                                let position = if move_.is_floating {
-                                    InsertPosition::Floating
-                                } else {
-                                    InsertPosition::NewColumn(0)
-                                };
+                            (position, Some(geo.loc))
+                        }
+                        InsertWorkspace::NewAt(_) => {
+                            let position = if move_.is_floating {
+                                InsertPosition::Floating
+                            } else {
+                                InsertPosition::NewColumn(0)
+                            };
 
-                                (position, None)
-                            }
-                        };
-
-                        (mon, insert_ws, position, offset, zoom)
-                    } else {
-                        let mon = &mut monitors[*active_monitor_idx];
-                        let zoom = mon.overview_zoom();
-                        // No point in trying to use the pointer position on the wrong output.
-                        let ws = &mon.workspaces[0];
-                        let ws_geo = mon.workspaces_render_geo().next().unwrap();
-
-                        let position = if move_.is_floating {
-                            InsertPosition::Floating
-                        } else {
-                            ws.scrolling_insert_position(Point::from((0., 0.)))
-                        };
-
-                        let insert_ws = InsertWorkspace::Existing(ws.id());
-                        (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                            (position, None)
+                        }
                     };
+
+                    (mon, insert_ws, position, offset, zoom)
+                } else {
+                    let mon = &mut monitors[*active_monitor_idx];
+                    let zoom = mon.overview_zoom();
+                    // No point in trying to use the pointer position on the wrong output.
+                    let ws = &mon.workspaces[0];
+                    let ws_geo = mon.workspaces_render_geo().next().unwrap();
+
+                    let position = if move_.is_floating {
+                        InsertPosition::Floating
+                    } else {
+                        ws.scrolling_insert_position(Point::from((0., 0.)), false)
+                    };
+
+                    let insert_ws = InsertWorkspace::Existing(ws.id());
+                    (mon, insert_ws, position, Some(ws_geo.loc), zoom)
+                };
 
                 let win_id = move_.tile.window().id().clone();
                 let tile_render_loc = move_.tile_render_location(zoom);
@@ -4236,6 +4307,22 @@ impl<W: LayoutElement> Layout<W> {
                 };
 
                 match position {
+                    InsertPosition::SplitColumn(column_idx, right) => {
+                        let width = mon.workspaces[ws_idx].prepare_column_split(column_idx);
+                        let ws_id = mon.workspaces[ws_idx].id();
+                        mon.add_tile(
+                            move_.tile,
+                            MonitorAddWindowTarget::Workspace {
+                                id: ws_id,
+                                column_idx: Some(column_idx + usize::from(right)),
+                            },
+                            ActivateWindow::Yes,
+                            allow_to_activate_workspace,
+                            width,
+                            false,
+                            false,
+                        );
+                    }
                     InsertPosition::NewColumn(column_idx) => {
                         let ws_id = mon.workspaces[ws_idx].id();
                         mon.add_tile(
@@ -4262,7 +4349,10 @@ impl<W: LayoutElement> Layout<W> {
                         );
                     }
                     InsertPosition::Floating => {
-                        let tile_render_loc = move_.tile_render_location(zoom);
+                        // Animation offsets are visual only; persisting them can
+                        // throw a quick drop far outside the workspace.
+                        let tile_render_loc = move_.tile_render_location(zoom)
+                            - move_.tile.render_offset().upscale(zoom);
 
                         let mut tile = move_.tile;
                         tile.floating_pos = None;
@@ -4270,7 +4360,15 @@ impl<W: LayoutElement> Layout<W> {
                         match insert_ws {
                             InsertWorkspace::Existing(_) => {
                                 if let Some(offset) = offset {
-                                    let pos = (tile_render_loc - offset).downscale(zoom);
+                                    let mut pos = (tile_render_loc - offset).downscale(zoom);
+                                    if mon.overview_open {
+                                        let mut rect = Rectangle::new(pos, tile.tile_size());
+                                        crate::utils::clamp_preferring_top_left_in_area(
+                                            mon.workspaces[ws_idx].working_area(),
+                                            &mut rect,
+                                        );
+                                        pos = rect.loc;
+                                    }
                                     let pos =
                                         mon.workspaces[ws_idx].floating_logical_to_size_frac(pos);
                                     tile.floating_pos = Some(pos);
@@ -4588,6 +4686,9 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         for mon in monitors {
+            if mon.overview_open != self.overview_open {
+                mon.prepare_overview_transition(self.overview_open);
+            }
             mon.overview_open = self.overview_open;
             mon.set_overview_progress(self.overview_progress.as_ref());
         }
@@ -4604,7 +4705,7 @@ impl<W: LayoutElement> Layout<W> {
             from,
             to,
             0.,
-            self.options.animations.overview_open_close.0,
+            self.options.overview_animation(),
         )));
 
         self.set_monitors_overview_state();
@@ -4629,7 +4730,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn toggle_overview_to_workspace(&mut self, ws_idx: usize) {
-        let config = self.options.animations.overview_open_close.0;
+        let config = self.options.overview_animation();
         if let Some(mon) = self.active_monitor() {
             mon.activate_workspace_with_anim_config(ws_idx, Some(config));
         }
@@ -5011,9 +5112,14 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
     }
 }
 
-fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
+fn compute_overview_zoom(
+    options: &Options,
+    overview_progress: Option<f64>,
+    fit_zoom: Option<f64>,
+) -> f64 {
     // Clamp to some sane values.
-    let zoom = options.overview.zoom.clamp(0.0001, 0.75);
+    let configured = options.overview.zoom.clamp(0.0001, 0.75);
+    let zoom = fit_zoom.unwrap_or(configured).clamp(0.0001, configured);
 
     if let Some(p) = overview_progress {
         (1. - p * (1. - zoom)).max(0.0001)

@@ -118,11 +118,23 @@ impl MergeWith<ClipboardPart> for Clipboard {
     }
 }
 
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewMode {
+    /// Keep the focused workspace centered and scroll through the workspace stack.
+    Scrolling,
+    /// Scale and center the complete workspace stack on the output.
+    #[default]
+    Fit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Overview {
     pub zoom: f64,
     pub backdrop_color: Color,
     pub workspace_shadow: WorkspaceShadow,
+    pub mode: OverviewMode,
+    /// Linux evdev button code for the held canvas controller; zero disables it.
+    pub canvas_button: u32,
 }
 
 impl Default for Overview {
@@ -131,6 +143,8 @@ impl Default for Overview {
             zoom: 0.5,
             backdrop_color: DEFAULT_BACKDROP_COLOR,
             workspace_shadow: WorkspaceShadow::default(),
+            mode: OverviewMode::default(),
+            canvas_button: 0,
         }
     }
 }
@@ -143,12 +157,16 @@ pub struct OverviewPart {
     pub backdrop_color: Option<Color>,
     #[knuffel(child)]
     pub workspace_shadow: Option<WorkspaceShadowPart>,
+    #[knuffel(child, unwrap(argument))]
+    pub mode: Option<OverviewMode>,
+    #[knuffel(child, unwrap(argument))]
+    pub canvas_button: Option<u32>,
 }
 
 impl MergeWith<OverviewPart> for Overview {
     fn merge_with(&mut self, part: &OverviewPart) {
         merge!((self, part), zoom, workspace_shadow);
-        merge_clone!((self, part), backdrop_color);
+        merge_clone!((self, part), backdrop_color, mode, canvas_button);
     }
 }
 

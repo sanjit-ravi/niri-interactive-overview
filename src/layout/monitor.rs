@@ -3,7 +3,7 @@ use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
 
-use niri_config::{CornerRadius, LayoutPart};
+use niri_config::{CornerRadius, LayoutPart, OverviewMode};
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
@@ -11,6 +11,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use super::insert_hint_element::{InsertHintElement, InsertHintRenderElement};
+use super::overview_camera::{CameraLayout, OverviewCamera, WorkspacePose};
 use super::scrolling::{Column, ColumnWidth};
 use super::tile::Tile;
 use super::workspace::{
@@ -70,6 +71,8 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) previous_workspace_id: Option<WorkspaceId>,
     /// In-progress switch between workspaces.
     pub(super) workspace_switch: Option<WorkspaceSwitch>,
+    /// In-progress tactile drag of an overview workspace badge.
+    workspace_drag: Option<WorkspaceDrag>,
     /// Indication where an interactively-moved window is about to be placed.
     pub(super) insert_hint: Option<InsertHint>,
     /// Insert hint element for rendering.
@@ -80,6 +83,7 @@ pub struct Monitor<W: LayoutElement> {
     pub(super) overview_open: bool,
     /// Progress of the overview zoom animation, 1 is fully in overview.
     overview_progress: Option<OverviewProgress>,
+    fit_camera: Option<OverviewCamera>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -94,6 +98,65 @@ pub struct Monitor<W: LayoutElement> {
 pub enum WorkspaceSwitch {
     Animation(Animation),
     Gesture(WorkspaceSwitchGesture),
+}
+
+#[derive(Debug)]
+struct WorkspaceDrag {
+    workspace: WorkspaceId,
+    pointer_start_y: f64,
+    pointer_y: f64,
+    settling: Option<Animation>,
+    /// Offsets in pixels for workspaces that are sliding into their logical slots.
+    slot_animations: Vec<(WorkspaceId, Animation)>,
+}
+
+impl WorkspaceDrag {
+    fn pointer_offset(&self) -> f64 {
+        self.settling
+            .as_ref()
+            .map_or(self.pointer_y - self.pointer_start_y, Animation::value)
+    }
+
+    fn slot_offset(&self, workspace: WorkspaceId) -> f64 {
+        self.slot_animations
+            .iter()
+            .find_map(|(id, animation)| (*id == workspace).then(|| animation.value()))
+            .unwrap_or(0.)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InsertPosition {
+    NewColumn(usize),
+    InColumn(usize, usize),
+    SplitColumn(usize, bool),
+    Floating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InsertWorkspace {
+    Existing(WorkspaceId),
+    NewAt(usize),
+}
+
+#[derive(Debug)]
+pub(super) struct InsertHint {
+    pub workspace: InsertWorkspace,
+    pub position: InsertPosition,
+    pub preview_tile_size: Size<f64, Logical>,
+    pub corner_radius: CornerRadius,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InsertHintRenderLoc {
+    workspace: InsertWorkspace,
+    location: Point<f64, Logical>,
+}
+
+#[derive(Debug)]
+pub(super) enum OverviewProgress {
+    Animation(Animation),
+    Value(f64),
 }
 
 #[derive(Debug)]
@@ -124,38 +187,6 @@ pub struct WorkspaceSwitchGesture {
     //
     // If `None` then the scroll delta is currently zero.
     dnd_nonzero_start_time: Option<Duration>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum InsertPosition {
-    NewColumn(usize),
-    InColumn(usize, usize),
-    Floating,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum InsertWorkspace {
-    Existing(WorkspaceId),
-    NewAt(usize),
-}
-
-#[derive(Debug)]
-pub(super) struct InsertHint {
-    pub workspace: InsertWorkspace,
-    pub position: InsertPosition,
-    pub corner_radius: CornerRadius,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct InsertHintRenderLoc {
-    workspace: InsertWorkspace,
-    location: Point<f64, Logical>,
-}
-
-#[derive(Debug)]
-pub(super) enum OverviewProgress {
-    Animation(Animation),
-    Value(f64),
 }
 
 /// Where to put a newly added window.
@@ -341,7 +372,9 @@ impl<W: LayoutElement> Monitor<W> {
             insert_hint_render_loc: None,
             overview_open: false,
             overview_progress: None,
+            fit_camera: None,
             workspace_switch: None,
+            workspace_drag: None,
             clock,
             base_options,
             options,
@@ -373,6 +406,9 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn active_workspace_ref(&self) -> &Workspace<W> {
         &self.workspaces[self.active_workspace_idx]
+    }
+    pub fn workspaces(&self) -> &[Workspace<W>] {
+        &self.workspaces
     }
 
     pub fn find_named_workspace(&self, workspace_name: &str) -> Option<&Workspace<W>> {
@@ -1068,21 +1104,52 @@ impl<W: LayoutElement> Monitor<W> {
             }
             None => (),
         }
+        if self.workspace_drag.as_ref().is_some_and(|drag| {
+            drag.settling.as_ref().is_some_and(Animation::is_done)
+                && drag
+                    .slot_animations
+                    .iter()
+                    .all(|(_, animation)| animation.is_done())
+        }) {
+            self.workspace_drag = None;
+        }
 
         for ws in &mut self.workspaces {
             ws.advance_animations();
         }
+        if let Some(camera) = &mut self.fit_camera {
+            camera.finish_if_done();
+        }
     }
 
     pub(super) fn are_animations_ongoing(&self) -> bool {
+        if self
+            .fit_camera
+            .as_ref()
+            .is_some_and(OverviewCamera::is_animating)
+        {
+            return true;
+        }
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
+            || self.workspace_drag.as_ref().is_some_and(|drag| {
+                drag.settling.is_some()
+                    || drag
+                        .slot_animations
+                        .iter()
+                        .any(|(_, animation)| !animation.is_done())
+            })
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
     pub fn are_transitions_ongoing(&self) -> bool {
         self.workspace_switch.is_some()
+            || self.workspace_drag.is_some()
+            || self
+                .fit_camera
+                .as_ref()
+                .is_some_and(OverviewCamera::is_animating)
             || self
                 .workspaces
                 .iter()
@@ -1109,7 +1176,9 @@ impl<W: LayoutElement> Monitor<W> {
             match hint.workspace {
                 InsertWorkspace::Existing(ws_id) => {
                     if let Some(ws) = self.workspaces.iter().find(|ws| ws.id() == ws_id) {
-                        if let Some(mut area) = ws.insert_hint_area(hint.position) {
+                        if let Some(mut area) =
+                            ws.insert_hint_area(hint.position, hint.preview_tile_size)
+                        {
                             let scale = ws.scale().fractional_scale();
                             let view_size = ws.view_size();
 
@@ -1166,7 +1235,7 @@ impl<W: LayoutElement> Monitor<W> {
 
                     // Compute view rect as if we're above the next workspace (rather than below
                     // the previous one).
-                    let view_rect = Rectangle::new(hint_loc_diff, next_ws_geo.size);
+                    let view_rect = Rectangle::new(hint_loc_diff, self.workspace_size(zoom));
 
                     self.insert_hint_element.update_render_elements(
                         hint_size,
@@ -1342,6 +1411,158 @@ impl<W: LayoutElement> Monitor<W> {
         self.clean_up_workspaces();
     }
 
+    fn workspace_drag_pitch(&self) -> f64 {
+        self.workspace_size_with_gap(self.overview_zoom()).h
+    }
+
+    /// Starts tracking a workspace badge without changing the logical workspace order.
+    pub fn begin_workspace_drag(&mut self, workspace: WorkspaceId, pointer_y: f64) -> bool {
+        if !self.overview_open
+            || self
+                .workspaces
+                .iter()
+                .all(|candidate| candidate.id() != workspace)
+        {
+            return false;
+        }
+
+        self.workspace_drag = Some(WorkspaceDrag {
+            workspace,
+            pointer_start_y: pointer_y,
+            pointer_y,
+            settling: None,
+            slot_animations: Vec::new(),
+        });
+        true
+    }
+
+    fn reorder_workspace_for_drag(
+        &mut self,
+        drag: &mut WorkspaceDrag,
+        old_idx: usize,
+        requested_idx: usize,
+        pitch: f64,
+    ) -> bool {
+        if self.workspaces.len() <= old_idx {
+            return false;
+        }
+
+        let new_idx = requested_idx.min(self.workspaces.len() - 1);
+        if old_idx == new_idx {
+            return false;
+        }
+
+        let old_positions = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(idx, workspace)| {
+                (
+                    workspace.id(),
+                    idx as f64 * pitch + drag.slot_offset(workspace.id()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        self.move_workspace_to_idx(old_idx, new_idx);
+
+        let actual_new_idx = self
+            .workspaces
+            .iter()
+            .position(|candidate| candidate.id() == drag.workspace)
+            .unwrap_or(new_idx);
+        drag.pointer_start_y += (actual_new_idx as f64 - old_idx as f64) * pitch;
+
+        let config = self.options.animations.workspace_switch.0;
+        drag.slot_animations = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, workspace)| {
+                if workspace.id() == drag.workspace {
+                    return None;
+                }
+                let old_position = old_positions
+                    .iter()
+                    .find_map(|(id, position)| (*id == workspace.id()).then_some(*position))?;
+                let offset = old_position - idx as f64 * pitch;
+                (offset.abs() > f64::EPSILON).then(|| {
+                    (
+                        workspace.id(),
+                        Animation::new(self.clock.clone(), offset, 0., 0., config),
+                    )
+                })
+            })
+            .collect();
+
+        actual_new_idx != old_idx
+    }
+
+    /// Updates the pointer position and moves the logical slot only after crossing its midpoint.
+    pub fn update_workspace_drag(&mut self, workspace: WorkspaceId, pointer_y: f64) -> bool {
+        let Some(mut drag) = self.workspace_drag.take() else {
+            return false;
+        };
+        if drag.workspace != workspace || drag.settling.is_some() {
+            self.workspace_drag = Some(drag);
+            return false;
+        }
+
+        drag.pointer_y = pointer_y.clamp(0., self.view_size.h);
+        let pitch = self.workspace_drag_pitch().max(1.);
+        let mut changed = false;
+
+        loop {
+            let Some(old_idx) = self
+                .workspaces
+                .iter()
+                .position(|candidate| candidate.id() == drag.workspace)
+            else {
+                break;
+            };
+            let offset = drag.pointer_y - drag.pointer_start_y;
+            let target = if offset > pitch / 2. {
+                old_idx.checked_add(1)
+            } else if offset < -pitch / 2. {
+                old_idx.checked_sub(1)
+            } else {
+                None
+            };
+            let Some(target) = target else {
+                break;
+            };
+            if !self.reorder_workspace_for_drag(&mut drag, old_idx, target, pitch) {
+                break;
+            }
+            changed = true;
+        }
+
+        self.workspace_drag = Some(drag);
+        changed
+    }
+
+    /// Begins the settle animation and leaves the final order in its logical slots.
+    pub fn end_workspace_drag(&mut self, workspace: WorkspaceId) -> bool {
+        let Some(mut drag) = self.workspace_drag.take() else {
+            return false;
+        };
+        if drag.workspace != workspace {
+            self.workspace_drag = Some(drag);
+            return false;
+        }
+
+        let offset = drag.pointer_offset();
+        drag.settling = Some(Animation::new(
+            self.clock.clone(),
+            offset,
+            0.,
+            0.,
+            self.options.animations.workspace_switch.0,
+        ));
+        self.workspace_drag = Some(drag);
+        true
+    }
+
     /// Returns the geometry of the active tile relative to and clamped to the output.
     ///
     /// During animations, assumes the final view position.
@@ -1371,13 +1592,212 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn overview_zoom(&self) -> f64 {
+        if let Some(camera) = &self.fit_camera {
+            return camera.zoom();
+        }
         let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+        compute_overview_zoom(&self.options, progress, self.fit_overview_zoom())
+    }
+
+    fn fit_workspace_count(&self) -> usize {
+        self.workspaces.len()
+            - usize::from(
+                self.workspaces
+                    .last()
+                    .is_some_and(|ws| !ws.has_windows_or_name()),
+            )
+    }
+
+    fn fit_overview_zoom(&self) -> Option<f64> {
+        if self.options.overview.mode != OverviewMode::Fit {
+            return None;
+        }
+
+        let count = self.fit_workspace_count().max(1) as f64;
+        let stack_height = count + (count - 1.) * 0.1;
+        let vertical_fit = 0.92 / stack_height;
+        let horizontal_fit = self
+            .workspaces
+            .iter()
+            .filter_map(|workspace| self.workspace_content_x_bounds(workspace))
+            .map(|(left, right)| right - left)
+            .filter(|width| width.is_finite() && *width > 0.)
+            .map(|width| self.view_size.w * 0.92 / width)
+            .fold(f64::INFINITY, f64::min);
+        Some(
+            vertical_fit
+                .min(horizontal_fit)
+                .min(self.options.overview.zoom),
+        )
+    }
+
+    fn workspace_content_x_bounds(&self, workspace: &Workspace<W>) -> Option<(f64, f64)> {
+        let window_bounds = workspace.overview_target_x_bounds();
+
+        let hint_bounds = self.insert_hint.as_ref().and_then(|hint| {
+            (hint.workspace == InsertWorkspace::Existing(workspace.id()))
+                .then(|| workspace.insert_hint_area(hint.position, hint.preview_tile_size))
+                .flatten()
+                .map(|area| (area.loc.x, area.loc.x + area.size.w))
+        });
+
+        match (window_bounds, hint_bounds) {
+            (Some((window_left, window_right)), Some((hint_left, hint_right))) => {
+                Some((window_left.min(hint_left), window_right.max(hint_right)))
+            }
+            (window_bounds, hint_bounds) => window_bounds.or(hint_bounds),
+        }
+    }
+
+    fn camera_layout(&self, open: bool, active_index: f64) -> CameraLayout {
+        let zoom = if open {
+            self.fit_overview_zoom()
+                .unwrap_or(self.options.overview.zoom)
+        } else {
+            1.
+        };
+        let count = self.fit_workspace_count().max(1) as f64;
+        let size = self.workspace_size(zoom);
+        let gap = self.workspace_gap(zoom);
+        let pitch = size.h + gap;
+        let top = if open {
+            (self.view_size.h - (size.h * count + gap * (count - 1.))) / 2.
+        } else {
+            -active_index * self.view_size.h
+        };
+        let workspaces = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(idx, ws)| {
+                let bounds = self.workspace_content_x_bounds(ws);
+                let x = if open {
+                    bounds.map_or((self.view_size.w - size.w) / 2., |(left, right)| {
+                        (self.view_size.w - (right - left) * zoom) / 2. - left * zoom
+                    })
+                } else {
+                    0.
+                };
+                WorkspacePose {
+                    id: ws.id(),
+                    location: Point::from((
+                        x,
+                        top + idx as f64 * if open { pitch } else { self.view_size.h },
+                    )),
+                    label_left: if open {
+                        x + bounds.map_or(0., |(left, _)| left * zoom)
+                    } else {
+                        0.
+                    },
+                    opacity: if open && idx >= self.fit_workspace_count() {
+                        0.
+                    } else {
+                        1.
+                    },
+                }
+            })
+            .collect();
+        CameraLayout {
+            zoom,
+            workspaces,
+            open,
+        }
+    }
+
+    fn sync_fit_camera(&mut self, progress: Option<&super::OverviewProgress>) {
+        if self.options.overview.mode != OverviewMode::Fit || progress.is_none() {
+            self.fit_camera = None;
+            return;
+        }
+        if matches!(progress, Some(super::OverviewProgress::Gesture(_))) {
+            self.fit_camera = None;
+            return;
+        }
+        let target = self.camera_layout(self.overview_open, self.active_workspace_idx as f64);
+        if self
+            .fit_camera
+            .as_ref()
+            .is_some_and(|camera| camera.target == target)
+        {
+            return;
+        }
+        let from = self
+            .fit_camera
+            .as_ref()
+            .map(OverviewCamera::sample)
+            .unwrap_or_else(|| self.camera_layout(false, self.workspace_render_idx()));
+        let config = self.options.overview_animation();
+        if self.overview_open && from.open {
+            for workspace in &mut self.workspaces {
+                let was_visible = from
+                    .workspaces
+                    .iter()
+                    .any(|pose| pose.id == workspace.id() && pose.opacity > 0.);
+                let now_visible = target
+                    .workspaces
+                    .iter()
+                    .any(|pose| pose.id == workspace.id() && pose.opacity > 0.);
+                if !was_visible && now_visible {
+                    for tile in workspace.tiles_mut() {
+                        tile.animate_alpha(0., 1., config);
+                    }
+                }
+            }
+        }
+        let from = if self.workspace_drag.is_some() && from.open {
+            target.clone()
+        } else {
+            from
+        };
+        self.fit_camera = Some(OverviewCamera::new(
+            from,
+            target,
+            self.clock.clone(),
+            config,
+        ));
+    }
+
+    pub fn workspace_overview_opacity(&self, id: WorkspaceId) -> f32 {
+        self.fit_camera
+            .as_ref()
+            .and_then(|camera| camera.pose(id))
+            .map_or(1., |pose| pose.opacity as f32)
+    }
+
+    pub(super) fn prepare_overview_transition(&mut self, open: bool) {
+        if self.options.overview.mode != OverviewMode::Fit {
+            return;
+        }
+        let zoom = self.overview_zoom();
+        let to_zoom = if open {
+            self.fit_overview_zoom().unwrap()
+        } else {
+            1.
+        };
+        let config = self.options.overview_animation();
+        for workspace in &mut self.workspaces {
+            workspace.prepare_overview_transition(zoom, to_zoom, config);
+        }
+        // The fixed camera already interpolates workspace selection. Do not
+        // leave an independent workspace-switch animation running underneath it.
+        if !open {
+            self.workspace_switch = None;
+        }
     }
 
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
+        self.sync_fit_camera(progress);
+        if !self.overview_open {
+            // Closing or unsetting the overview aborts any active badge drag rather than leaving
+            // the next overview with a stale pointer offset.
+            self.workspace_drag = None;
+        }
+
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
+        if self.options.overview.mode == OverviewMode::Fit {
+            return;
+        }
         let new_render_idx = self.workspace_render_idx();
 
         // If the view jumped (can happen when going from corrected to uncorrected render_idx, for
@@ -1397,8 +1817,14 @@ impl<W: LayoutElement> Monitor<W> {
     }
 
     pub fn workspace_render_idx(&self) -> f64 {
-        // If workspace switch and overview progress are matching animations, then compute a
-        // correction term to make the movement appear monotonic.
+        if self.options.overview.mode == OverviewMode::Fit {
+            return self.workspace_switch.as_ref().map_or(
+                self.active_workspace_idx as f64,
+                WorkspaceSwitch::current_idx,
+            );
+        }
+        // During a simultaneous overview zoom and workspace switch, use the corrected render
+        // index so the apparent motion remains monotonic.
         if let (
             Some(WorkspaceSwitch::Animation(switch_anim)),
             Some(OverviewProgress::Animation(progress_anim)),
@@ -1409,71 +1835,43 @@ impl<W: LayoutElement> Monitor<W> {
                     .abs()
                     <= 0.001
             {
-                #[rustfmt::skip]
-                // How this was derived:
-                //
-                // - Assume we're animating a zoom + switch. Consider switch "from" and "to".
-                //   These are render_idx values, so first workspace to second would have switch
-                //   from = 0. and to = 1. regardless of the zoom level.
-                //
-                // - At the start, the point at "from" is at Y = 0. We're moving the point at "to"
-                //   to Y = 0. We want this to be a monotonic motion in apparent coordinates (after
-                //   zoom).
-                //
-                // - Height at the start:
-                //   from_height = (size.h + gap) * from_zoom.
-                //
-                // - Current height:
-                //   current_height = (size.h + gap) * zoom.
-                //
-                // - We're moving the "to" point to Y = 0:
-                //   to_y = 0.
-                //
-                // - The initial position of the point we're moving:
-                //   from_y = (to - from) * from_height.
-                //
-                // - We want this point to travel monotonically in apparent coordinates:
-                //   current_y = from_y + (to_y - from_y) * progress,
-                //   where progress is from 0 to 1, equals to the animation progress (switch and
-                //   zoom are the same since they are synchronized).
-                //
-                // - Derive the Y of the first workspace from this:
-                //   first_y = current_y - to * current_height.
-                //
-                // Now, let's substitute and rearrange the terms.
-                //
-                // - current_y = from_y + (0 - (to - from) * from_height) * progress
-                // - progress = (switch_anim.value() - from) / (to - from)
-                // - current_y = from_y - (to - from) * from_height * (switch_anim.value() - from) / (to - from)
-                // - current_y = from_y - from_height * (switch_anim.value() - from)
-                // - first_y = from_y - from_height * (switch_anim.value() - from) - to * current_height
-                // - first_y = (to - from) * from_height - from_height * (switch_anim.value() - from) - to * current_height
-                // - first_y = to * from_height - switch_anim.value() * from_height - to * current_height
-                // - first_y = -switch_anim.value() * from_height + to * (from_height - current_height)
                 let from = progress_anim.from();
-                let from_zoom = compute_overview_zoom(&self.options, Some(from));
+                let from_zoom =
+                    compute_overview_zoom(&self.options, Some(from), self.fit_overview_zoom());
                 let from_ws_height_with_gap = self.workspace_size_with_gap(from_zoom).h;
-
                 let zoom = self.overview_zoom();
                 let ws_height_with_gap = self.workspace_size_with_gap(zoom).h;
-
                 let first_ws_y = -switch_anim.value() * from_ws_height_with_gap
                     + switch_anim.to() * (from_ws_height_with_gap - ws_height_with_gap);
-
                 return -first_ws_y / ws_height_with_gap;
             }
-        };
-
-        if let Some(switch) = &self.workspace_switch {
-            switch.current_idx()
-        } else {
-            self.active_workspace_idx as f64
         }
+
+        self.workspace_switch.as_ref().map_or(
+            self.active_workspace_idx as f64,
+            WorkspaceSwitch::current_idx,
+        )
     }
 
     pub fn workspaces_render_geo(&self) -> impl Iterator<Item = Rectangle<f64, Logical>> {
         let scale = self.scale.fractional_scale();
         let zoom = self.overview_zoom();
+        let camera_poses = if self.workspace_drag.is_some() && self.overview_open {
+            Some(
+                self.camera_layout(true, self.active_workspace_idx as f64)
+                    .workspaces
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            self.fit_camera.as_ref().map(|camera| {
+                self.workspaces
+                    .iter()
+                    .map(|ws| camera.pose(ws.id()))
+                    .collect::<Vec<_>>()
+            })
+        };
 
         let ws_size = self.workspace_size(zoom);
         let gap = self.workspace_gap(zoom);
@@ -1484,21 +1882,88 @@ impl<W: LayoutElement> Monitor<W> {
             .to_physical_precise_round(scale)
             .to_logical(scale);
 
-        let first_ws_y = -self.workspace_render_idx() * ws_height_with_gap;
-        let first_ws_y = round_logical_in_physical(scale, first_ws_y);
+        let render_idx = self.workspace_render_idx();
+        let first_ws_y = -render_idx * ws_height_with_gap;
+
+        let fit_progress = if self.options.overview.mode == OverviewMode::Fit {
+            self.overview_progress
+                .as_ref()
+                .map(|progress| progress.clamped_value().clamp(0., 1.))
+                .unwrap_or(0.)
+        } else {
+            0.
+        };
+        let workspace_count = self.workspaces.len();
+        let hidden_trailing = (fit_progress > 0. && self.fit_workspace_count() < workspace_count)
+            .then_some(workspace_count - 1);
+        let view_height = self.view_size.h;
+        let fit_target = (self.options.overview.mode == OverviewMode::Fit
+            && self.overview_progress.is_some())
+        .then(|| self.camera_layout(true, self.active_workspace_idx as f64));
+        let workspace_drag_offsets = self
+            .workspace_drag
+            .as_ref()
+            .map(|drag| {
+                self.workspaces
+                    .iter()
+                    .map(|workspace| {
+                        if workspace.id() == drag.workspace {
+                            drag.pointer_offset()
+                        } else {
+                            drag.slot_offset(workspace.id())
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         // Return position for one-past-last workspace too.
-        (0..=self.workspaces.len()).map(move |idx| {
-            let y = first_ws_y + idx as f64 * ws_height_with_gap;
-            let loc = Point::from((0., y)) + static_offset;
+        (0..=workspace_count).map(move |idx| {
+            if let Some(pose) = camera_poses
+                .as_ref()
+                .and_then(|poses| poses.get(idx))
+                .and_then(Option::as_ref)
+            {
+                let mut size = ws_size;
+                if hidden_trailing == Some(idx) || pose.opacity <= 0. {
+                    size.h = 0.;
+                }
+                let loc = pose.location
+                    + Point::from((0., workspace_drag_offsets.get(idx).copied().unwrap_or(0.)));
+                return Rectangle::new(
+                    loc.to_physical_precise_round(scale).to_logical(scale),
+                    size,
+                );
+            }
+            let drag_offset = workspace_drag_offsets.get(idx).copied().unwrap_or(0.);
+            let mut loc = Point::from((
+                static_offset.x,
+                first_ws_y + idx as f64 * ws_height_with_gap + static_offset.y,
+            ));
+            if let Some(target) = &fit_target {
+                let destination = target
+                    .workspaces
+                    .get(idx)
+                    .map(|pose| pose.location)
+                    .unwrap_or_else(|| {
+                        let last = target
+                            .workspaces
+                            .last()
+                            .map_or(Point::default(), |pose| pose.location);
+                        last + Point::from((0., view_height * target.zoom * 1.1))
+                    });
+                let source = Point::from((0., (idx as f64 - render_idx) * view_height));
+                loc = source + (destination - source).upscale(fit_progress);
+            }
+            loc.y += drag_offset;
 
-            // Even though all components that go into loc are rounded to physical pixels, the
-            // floating point addition may lose precision. This can result for example in the
-            // current workspace having y = 0.0000000000002 and thus missing pointer hits at the
-            // monitor edge with y = 0. So, post-round the location too.
+            // Post-round after combining the offsets to avoid precision misses at input edges.
             let loc = loc.to_physical_precise_round(scale).to_logical(scale);
-
-            Rectangle::new(loc, ws_size)
+            let mut size = ws_size;
+            if hidden_trailing == Some(idx) {
+                size.h = 0.;
+            }
+            Rectangle::new(loc, size)
         })
     }
 
@@ -1510,7 +1975,7 @@ impl<W: LayoutElement> Monitor<W> {
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| geo.intersection(output_geo).is_some())
+            .filter(move |(_ws, geo)| geo.size.h > 0. && geo.intersection(output_geo).is_some())
     }
 
     pub fn workspaces_with_render_geo_idx(
@@ -1521,7 +1986,31 @@ impl<W: LayoutElement> Monitor<W> {
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter().enumerate(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| geo.intersection(output_geo).is_some())
+            .filter(move |(_ws, geo)| geo.size.h > 0. && geo.intersection(output_geo).is_some())
+    }
+
+    pub fn overview_workspace_labels(
+        &self,
+    ) -> impl Iterator<Item = (WorkspaceId, usize, Point<f64, Logical>)> + '_ {
+        let zoom = self.overview_zoom();
+        self.workspaces_with_render_geo_idx()
+            .map(move |((idx, workspace), geometry)| {
+                let content_left = self
+                    .fit_camera
+                    .as_ref()
+                    .and_then(|camera| camera.pose(workspace.id()))
+                    .map(|pose| pose.label_left)
+                    .unwrap_or_else(|| {
+                        self.workspace_content_x_bounds(workspace)
+                            .map(|(left, _)| geometry.loc.x + left * zoom)
+                            .unwrap_or(geometry.loc.x)
+                    });
+                (
+                    workspace.id(),
+                    idx + 1,
+                    Point::from((content_left, geometry.loc.y)),
+                )
+            })
     }
 
     pub fn workspaces_with_render_geo_mut(
@@ -1533,7 +2022,9 @@ impl<W: LayoutElement> Monitor<W> {
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter_mut(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| !cull || geo.intersection(output_geo).is_some())
+            .filter(move |(_ws, geo)| {
+                !cull || (geo.size.h > 0. && geo.intersection(output_geo).is_some())
+            })
     }
 
     pub fn workspace_under(
@@ -1575,6 +2066,137 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    /// Returns the topmost window that can receive pointer input in the displayed fit overview.
+    ///
+    /// Activation-only regions still obstruct windows behind them, but are not returned because
+    /// they cannot receive surface input.
+    pub fn overview_window_hit(
+        &self,
+        pos_within_output: Point<f64, Logical>,
+    ) -> Option<(&W, Point<f64, Logical>, f64)> {
+        if self.options.overview.mode != OverviewMode::Fit || !self.overview_open {
+            return None;
+        }
+
+        let output_geo = Rectangle::from_size(self.view_size);
+        if !output_geo.contains(pos_within_output) {
+            return None;
+        }
+
+        let zoom = self.overview_zoom();
+        let dragged_workspace = self.workspace_drag.as_ref().map(|drag| drag.workspace);
+        if let Some(id) = dragged_workspace {
+            if let Some((workspace, geo)) =
+                self.workspaces_with_render_geo().find(|(workspace, geo)| {
+                    workspace.id() == id
+                        && geo.loc.y <= pos_within_output.y
+                        && pos_within_output.y < geo.loc.y + geo.size.h
+                })
+            {
+                match self.overview_window_hit_in_workspace(workspace, geo, pos_within_output, zoom)
+                {
+                    Some(hit) => return hit,
+                    None => {}
+                }
+            }
+        }
+
+        for (workspace, geo) in self.workspaces_with_render_geo() {
+            if Some(workspace.id()) == dragged_workspace
+                || !(geo.loc.y <= pos_within_output.y
+                    && pos_within_output.y < geo.loc.y + geo.size.h)
+            {
+                continue;
+            }
+            match self.overview_window_hit_in_workspace(workspace, geo, pos_within_output, zoom) {
+                Some(hit) => return hit,
+                None => {}
+            }
+        }
+        None
+    }
+
+    fn overview_window_hit_in_workspace<'a>(
+        &'a self,
+        workspace: &'a Workspace<W>,
+        workspace_geo: Rectangle<f64, Logical>,
+        pos_within_output: Point<f64, Logical>,
+        zoom: f64,
+    ) -> Option<Option<(&'a W, Point<f64, Logical>, f64)>> {
+        let local_pos = (pos_within_output - workspace_geo.loc).downscale(zoom);
+        let Some((window, hit)) = workspace.window_under(local_pos) else {
+            return None;
+        };
+        if !matches!(hit, HitType::Input { .. }) {
+            return Some(None);
+        }
+
+        let origin = self
+            .overview_window_transform(window.id())
+            .map(|(origin, _)| origin)?;
+        Some(Some((window, origin, zoom)))
+    }
+
+    /// Returns the displayed buffer origin and scale for a visible window in the fit overview.
+    pub fn overview_window_transform(&self, window: &W::Id) -> Option<(Point<f64, Logical>, f64)> {
+        if self.options.overview.mode != OverviewMode::Fit || !self.overview_open {
+            return None;
+        }
+
+        let zoom = self.overview_zoom();
+        let output_geo = Rectangle::from_size(self.view_size);
+        self.workspaces_with_render_geo()
+            .find_map(|(workspace, workspace_geo)| {
+                workspace
+                    .tiles_with_render_positions()
+                    .find_map(|(tile, tile_pos, visible)| {
+                        if !visible
+                            || !tile.overview_input_geometry_is_live()
+                            || tile.window().id() != window
+                        {
+                            return None;
+                        }
+
+                        let bob_offset = tile.bob_offset();
+                        let window_geo = Rectangle::new(
+                            workspace_geo.loc
+                                + (tile_pos + bob_offset + tile.window_loc()).upscale(zoom),
+                            tile.animated_window_size().upscale(zoom),
+                        );
+                        let overlaps_workspace_vertically = window_geo.loc.y
+                            < workspace_geo.loc.y + workspace_geo.size.h
+                            && workspace_geo.loc.y < window_geo.loc.y + window_geo.size.h;
+                        if !overlaps_workspace_vertically
+                            || window_geo.intersection(output_geo).is_none()
+                        {
+                            return None;
+                        }
+
+                        Some((
+                            workspace_geo.loc
+                                + (tile_pos + bob_offset + tile.buf_loc()).upscale(zoom),
+                            zoom,
+                        ))
+                    })
+            })
+    }
+
+    pub fn window_visual_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
+        let zoom = self.overview_zoom();
+        self.workspaces_with_render_geo()
+            .find_map(|(workspace, workspace_geo)| {
+                workspace
+                    .tiles_with_render_positions()
+                    .find(|(tile, _, _)| tile.window().id() == window)
+                    .map(|(tile, tile_pos, _)| {
+                        Rectangle::new(
+                            workspace_geo.loc + (tile_pos + tile.window_loc()).upscale(zoom),
+                            tile.animated_window_size().upscale(zoom),
+                        )
+                    })
+            })
+    }
+
     pub fn resize_edges_under(&self, pos_within_output: Point<f64, Logical>) -> Option<ResizeEdge> {
         if self.overview_progress.is_some() {
             return None;
@@ -1592,8 +2214,10 @@ impl<W: LayoutElement> Monitor<W> {
 
         let dummy = Rectangle::default();
 
-        // Monitors always have at least one workspace.
-        let ((idx, ws), geo) = iter.next().unwrap();
+        // A completely empty output has no preview, but remains a valid target.
+        let Some(((idx, ws), geo)) = iter.next() else {
+            return (InsertWorkspace::NewAt(0), dummy);
+        };
 
         // Check if above first.
         if pos_within_output.y < geo.loc.y {
@@ -1720,7 +2344,17 @@ impl<W: LayoutElement> Monitor<W> {
             )
         };
 
-        for (ws, geo) in self.workspaces_with_render_geo() {
+        // Render elements are front-to-back: keep the grabbed workspace above
+        // the neighbors sliding beneath it, including during release settling.
+        let dragged = self.workspace_drag.as_ref().map(|drag| drag.workspace);
+        let front = dragged.into_iter().flat_map(|id| {
+            self.workspaces_with_render_geo()
+                .filter(move |(ws, _)| ws.id() == id)
+        });
+        let rest = self
+            .workspaces_with_render_geo()
+            .filter(|(ws, _)| Some(ws.id()) != dragged);
+        for (ws, geo) in front.chain(rest) {
             // Macro instead of closure because ws and insert hint have different elem types.
             macro_rules! push {
                 () => {{
@@ -1766,7 +2400,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         for (ws, geo) in self.workspaces_with_render_geo() {
             ws.render_shadow(renderer, &mut |elem| {
-                let elem = elem.with_alpha(alpha);
+                let elem = elem.with_alpha(alpha * self.workspace_overview_opacity(ws.id()));
                 let elem = MonitorInnerRenderElement::Shadow(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);
                 let elem = RelocateRenderElement::from_element(

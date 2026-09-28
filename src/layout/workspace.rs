@@ -25,7 +25,7 @@ use super::shadow::Shadow;
 use super::tile::{Tile, TileRenderSnapshot};
 use super::{
     ActivateWindow, HitType, InsertPosition, InteractiveResizeData, LayoutElement, Options,
-    RemovedTile, SizeFrac,
+    RemovedTile, SizeFrac, SizingMode,
 };
 use crate::animation::Clock;
 use crate::niri_render_elements;
@@ -588,6 +588,14 @@ impl<W: LayoutElement> Workspace<W> {
         self.view_size
     }
 
+    pub fn view_pos(&self) -> f64 {
+        self.scrolling.view_pos()
+    }
+
+    pub fn target_view_pos(&self) -> f64 {
+        self.scrolling.target_view_pos()
+    }
+
     pub fn make_tile(&self, window: W) -> Tile<W> {
         Tile::new(
             window,
@@ -742,6 +750,7 @@ impl<W: LayoutElement> Workspace<W> {
             self.scrolling.remove_tile(id, transaction)
         };
 
+
         if let Some(output) = &self.output {
             removed.tile.window().output_leave(output);
         }
@@ -758,6 +767,7 @@ impl<W: LayoutElement> Workspace<W> {
         } else {
             self.scrolling.remove_active_tile(transaction)?
         };
+
 
         if let Some(output) = &self.output {
             removed.tile.window().output_leave(output);
@@ -1570,6 +1580,7 @@ impl<W: LayoutElement> Workspace<W> {
         self.windows().next().is_some()
     }
 
+
     pub fn has_window(&self, window: &W::Id) -> bool {
         self.windows().any(|win| win.id() == window)
     }
@@ -1625,6 +1636,26 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
+    pub(super) fn overview_target_x_bounds(&self) -> Option<(f64, f64)> {
+        let mut bounds = self.scrolling.overview_target_x_bounds();
+        if self.is_floating_visible() {
+            for (tile, pos) in self.floating.tiles_with_offsets() {
+                let window = tile.window();
+                let width = match window.pending_sizing_mode() {
+                    SizingMode::Normal => tile.tile_width_for_window_width(f64::from(
+                        window.expected_size().unwrap_or_else(|| window.size()).w,
+                    )),
+                    SizingMode::Fullscreen => self.view_size.w,
+                    SizingMode::Maximized => self.working_area.size.w,
+                };
+                bounds = Some(bounds.map_or((pos.x, pos.x + width), |(left, right)| {
+                    (left.min(pos.x), right.max(pos.x + width))
+                }));
+            }
+        }
+        bounds
+    }
+
     pub fn render_scrolling<R: NiriRenderer>(
         &self,
         ctx: RenderCtx<R>,
@@ -1666,11 +1697,11 @@ impl<W: LayoutElement> Workspace<W> {
         self.shadow.render(renderer, Point::from((0., 0.)), push);
     }
 
-    pub fn render_background(&self) -> SolidColorRenderElement {
+    pub fn render_background(&self, alpha: f32) -> SolidColorRenderElement {
         SolidColorRenderElement::from_buffer(
             &self.background_buffer,
             Point::new(0., 0.),
-            1.,
+            alpha,
             Kind::Unspecified,
         )
     }
@@ -1768,6 +1799,22 @@ impl<W: LayoutElement> Workspace<W> {
         self.scrolling.window_under(pos)
     }
 
+    pub fn window_under_at_final_view(&self, pos: Point<f64, Logical>) -> Option<&W> {
+        if self.is_floating_visible() {
+            if let Some(window) =
+                self.floating
+                    .tiles_with_render_positions()
+                    .find_map(|(tile, tile_pos)| {
+                        HitType::hit_tile(tile, tile_pos, pos).map(|_| tile.window())
+                    })
+            {
+                return Some(window);
+            }
+        }
+
+        self.scrolling.window_under_at_final_view(pos)
+    }
+
     pub fn resize_edges_under(&self, pos: Point<f64, Logical>) -> Option<ResizeEdge> {
         self.tiles_with_render_positions()
             .find_map(|(tile, tile_pos, visible)| {
@@ -1857,15 +1904,35 @@ impl<W: LayoutElement> Workspace<W> {
         }
     }
 
-    pub(super) fn scrolling_insert_position(&self, pos: Point<f64, Logical>) -> InsertPosition {
-        self.scrolling.insert_position(pos)
+    pub(super) fn scrolling_insert_position(
+        &self,
+        pos: Point<f64, Logical>,
+        split_inside: bool,
+    ) -> InsertPosition {
+        self.scrolling.insert_position(pos, split_inside)
     }
+
+    pub(super) fn prepare_column_split(&mut self, index: usize) -> ColumnWidth {
+        self.scrolling.prepare_column_split(index)
+    }
+
 
     pub(super) fn insert_hint_area(
         &self,
         position: InsertPosition,
+        preview_tile_size: Size<f64, Logical>,
     ) -> Option<Rectangle<f64, Logical>> {
-        self.scrolling.insert_hint_area(position)
+        self.scrolling.insert_hint_area(position, preview_tile_size)
+    }
+
+    pub(super) fn prepare_overview_transition(
+        &mut self,
+        zoom: f64,
+        to_zoom: f64,
+        config: niri_config::Animation,
+    ) {
+        self.scrolling
+            .prepare_overview_transition(zoom, to_zoom, config);
     }
 
     pub fn view_offset_gesture_begin(&mut self, is_touchpad: bool) {

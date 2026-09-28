@@ -51,6 +51,7 @@ pub struct ScrollingSpace<W: LayoutElement> {
     /// with this view offset (rather than added as a constant elsewhere in the code). This allows
     /// for natural handling of fullscreen windows, which must ignore work area padding.
     view_offset: ViewOffset,
+    overview_focus: Option<OverviewFocus>,
 
     /// Whether to activate the previous, rather than the next, column upon column removal.
     ///
@@ -99,6 +100,24 @@ niri_render_elements! {
         Tile = TileRenderElement<R>,
         ClosingWindow = ClosingWindowRenderElement,
         TabIndicator = TabIndicatorRenderElement,
+    }
+}
+
+/// Interpolate view position in screen space while the overview scale changes.
+#[derive(Debug)]
+struct OverviewFocus {
+    from: f64,
+    to: f64,
+    from_zoom: f64,
+    to_zoom: f64,
+    animation: Animation,
+}
+
+impl OverviewFocus {
+    fn position(&self) -> f64 {
+        let p = self.animation.clamped_value();
+        let zoom = self.from_zoom + (self.to_zoom - self.from_zoom) * p;
+        (self.from * self.from_zoom * (1. - p) + self.to * self.to_zoom * p) / zoom
     }
 }
 
@@ -298,6 +317,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             active_column_idx: 0,
             interactive_resize: None,
             view_offset: ViewOffset::Static(0.),
+            overview_focus: None,
             activate_prev_column_on_removal: None,
             view_offset_to_restore: None,
             closing_windows: Vec::new(),
@@ -343,6 +363,13 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     pub fn advance_animations(&mut self) {
+        if self
+            .overview_focus
+            .as_ref()
+            .is_some_and(|focus| focus.animation.is_done())
+        {
+            self.overview_focus = None;
+        }
         if let ViewOffset::Animation(anim) = &self.view_offset {
             if anim.is_done() {
                 self.view_offset = ViewOffset::Static(anim.to());
@@ -420,6 +447,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
+
 
     pub fn active_window(&self) -> Option<&W> {
         if self.columns.is_empty() {
@@ -691,6 +719,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         new_view_offset: f64,
         config: niri_config::Animation,
     ) {
+        if self.overview_focus.as_ref().is_some_and(|focus| {
+            idx == self.active_column_idx
+                && (self.column_x(idx) + new_view_offset - focus.to).abs() < 1. / self.scale
+        }) {
+            // Client activation commits often request the same focus position.
+            // Keep the screen-space zoom interpolation instead of restarting
+            // the ordinary horizontal scroll spring.
+            return;
+        }
+        if let Some(focus) = self.overview_focus.take() {
+            self.view_offset =
+                ViewOffset::Static(focus.position() - self.column_x(self.active_column_idx));
+        }
         let new_col_x = self.column_x(idx);
         let old_col_x = self.column_x(self.active_column_idx);
         let offset_delta = old_col_x - new_col_x;
@@ -798,9 +839,31 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
-    pub(super) fn insert_position(&self, pos: Point<f64, Logical>) -> InsertPosition {
+    pub(super) fn insert_position(
+        &self,
+        pos: Point<f64, Logical>,
+        split_inside: bool,
+    ) -> InsertPosition {
         if self.columns.is_empty() {
             return InsertPosition::NewColumn(0);
+        }
+
+        if split_inside {
+            for (idx, col) in self.columns.iter().enumerate() {
+                let left = self.column_x(idx) - self.view_pos();
+                let width = self.data[idx].width;
+                let x = (pos.x - left) / width;
+                let y = (pos.y - self.working_area.loc.y) / self.working_area.size.h;
+                // The outer edge remains an insertion seam. Deeper inside a
+                // column, horizontal placement means splitting its footprint.
+                if (0.08..=0.92).contains(&x)
+                    && (0.0..=1.0).contains(&y)
+                    && x.min(1. - x) < y.min(1. - y)
+                    && col.tiles.len() == 1
+                {
+                    return InsertPosition::SplitColumn(idx, x >= 0.5);
+                }
+            }
         }
 
         let x = pos.x + self.view_pos();
@@ -863,6 +926,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         } else {
             InsertPosition::InColumn(col_idx, closest_tile_idx)
         }
+    }
+
+    pub(super) fn prepare_column_split(&mut self, index: usize) -> ColumnWidth {
+        let width = ((self.data[index].width - self.options.layout.gaps) / 2.).max(1.);
+        let column = &mut self.columns[index];
+        column.set_fullscreen(false);
+        column.set_maximized(false);
+        column.width = ColumnWidth::Fixed(width);
+        column.is_full_width = false;
+        column.preset_width_idx = None;
+        column.update_tile_sizes(true);
+        self.data[index].update(column);
+        ColumnWidth::Fixed(width)
     }
 
     pub fn add_tile(
@@ -2292,11 +2368,50 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     }
 
     pub fn view_pos(&self) -> f64 {
+        if let Some(focus) = &self.overview_focus {
+            return focus.position();
+        }
         self.column_x(self.active_column_idx) + self.view_offset.current()
     }
 
     pub fn target_view_pos(&self) -> f64 {
         self.column_x(self.active_column_idx) + self.view_offset.target()
+    }
+
+    pub(super) fn prepare_overview_transition(
+        &mut self,
+        zoom: f64,
+        to_zoom: f64,
+        config: niri_config::Animation,
+    ) {
+        let from = self.view_pos();
+        let to = self.target_view_pos();
+        self.view_offset = ViewOffset::Static(to - self.column_x(self.active_column_idx));
+        self.overview_focus = (from != to).then(|| OverviewFocus {
+            from,
+            to,
+            from_zoom: zoom,
+            to_zoom,
+            animation: Animation::new(self.clock.clone(), 0., 1., 0., config),
+        });
+    }
+
+    /// Horizontal bounds of the committed layout's destination, excluding all
+    /// movement/resize animation offsets and client configure latency.
+    pub(super) fn overview_target_x_bounds(&self) -> Option<(f64, f64)> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let mut total = 0.;
+        let mut active_x = 0.;
+        for (idx, column) in self.columns.iter().enumerate() {
+            if idx == self.active_column_idx {
+                active_x = total;
+            }
+            total += column.target_width() + self.options.layout.gaps;
+        }
+        let left = -active_x - self.view_offset.target();
+        Some((left, left + total - self.options.layout.gaps))
     }
 
     // HACK: pass a self.data iterator in manually as a workaround for the lack of method partial
@@ -2436,83 +2551,97 @@ impl<W: LayoutElement> ScrollingSpace<W> {
     pub(super) fn insert_hint_area(
         &self,
         position: InsertPosition,
+        preview_tile_size: Size<f64, Logical>,
     ) -> Option<Rectangle<f64, Logical>> {
+        let gaps = self.options.layout.gaps;
         let mut hint_area = match position {
             InsertPosition::NewColumn(column_index) => {
-                if column_index == 0 || column_index == self.columns.len() {
-                    let size = Size::from((
-                        300.,
-                        self.working_area.size.h - self.options.layout.gaps * 2.,
-                    ));
-                    let mut loc = Point::from((
-                        self.column_x(column_index),
-                        self.working_area.loc.y + self.options.layout.gaps,
-                    ));
-                    if column_index == 0 && !self.columns.is_empty() {
-                        loc.x -= size.w + self.options.layout.gaps;
-                    }
-                    Rectangle::new(loc, size)
-                } else if column_index > self.columns.len() {
-                    error!("insert hint column index is out of range");
-                    return None;
-                } else {
-                    let size = Size::from((
-                        300.,
-                        self.working_area.size.h - self.options.layout.gaps * 2.,
-                    ));
-                    let loc = Point::from((
-                        self.column_x(column_index) - size.w / 2. - self.options.layout.gaps / 2.,
-                        self.working_area.loc.y + self.options.layout.gaps,
-                    ));
-                    Rectangle::new(loc, size)
-                }
-            }
-            InsertPosition::InColumn(column_index, tile_index) => {
                 if column_index > self.columns.len() {
                     error!("insert hint column index is out of range");
                     return None;
                 }
 
-                let col = &self.columns[column_index];
+                let width = preview_tile_size.w.max(1.);
+                let size = Size::from((width, self.working_area.size.h - gaps * 2.));
+                let mut loc =
+                    Point::from((self.column_x(column_index), self.working_area.loc.y + gaps));
+                if column_index == 0 && !self.columns.is_empty() {
+                    loc.x -= size.w + gaps;
+                } else if column_index < self.columns.len() {
+                    loc.x -= size.w / 2. + gaps / 2.;
+                }
+                Rectangle::new(loc, size)
+            }
+            InsertPosition::SplitColumn(index, right) => {
+                self.columns.get(index)?;
+                let width = ((self.data[index].width - gaps) / 2.).max(1.);
+                let x = self.column_x(index) + if right { width + gaps } else { 0. };
+                Rectangle::new(
+                    Point::from((x, self.working_area.loc.y + gaps)),
+                    Size::from((width, self.working_area.size.h - gaps * 2.)),
+                )
+            }
+            InsertPosition::InColumn(column_index, tile_index) => {
+                let Some(col) = self.columns.get(column_index) else {
+                    error!("insert hint column index is out of range");
+                    return None;
+                };
                 if tile_index > col.tiles.len() {
                     error!("insert hint tile index is out of range");
                     return None;
                 }
 
                 let is_tabbed = col.display_mode == ColumnDisplay::Tabbed;
-
-                let (height, y) = if is_tabbed {
-                    // In tabbed mode, there's only one tile visible, and we want to draw the hint
-                    // at its top or bottom.
-                    let top = col.tile_offset(col.active_tile_idx).y;
-                    let bottom = top + col.data[col.active_tile_idx].size.h;
-
-                    if tile_index <= col.active_tile_idx {
-                        (150., top)
-                    } else {
-                        (150., bottom - 150.)
-                    }
-                } else {
-                    let top = col.tile_offset(tile_index).y;
-
-                    if tile_index == 0 {
-                        (150., top)
-                    } else if tile_index == col.tiles.len() {
-                        (150., top - self.options.layout.gaps - 150.)
-                    } else {
-                        (300., top - self.options.layout.gaps / 2. - 150.)
-                    }
-                };
-
-                // Adjust for place-within-column tab indicator.
                 let origin_x = col.tiles_origin().x;
                 let extra_w = if is_tabbed && col.sizing_mode().is_normal() {
                     col.tab_indicator.extra_size(col.tiles.len(), col.scale).w
                 } else {
                     0.
                 };
+                let width = self.data[column_index].width - extra_w;
 
-                let size = Size::from((self.data[column_index].width - extra_w, height));
+                let (height, y) = if is_tabbed {
+                    (
+                        self.working_area.size.h - gaps * 2.,
+                        self.working_area.loc.y + gaps,
+                    )
+                } else {
+                    let fixed_height = col
+                        .data
+                        .iter()
+                        .filter(|data| !matches!(data.height, WindowHeight::Auto { .. }))
+                        .map(|data| data.size.h)
+                        .sum();
+                    let auto_weight = 1.
+                        + col
+                            .data
+                            .iter()
+                            .filter_map(|data| match data.height {
+                                WindowHeight::Auto { weight } => Some(weight),
+                                _ => None,
+                            })
+                            .sum::<f64>();
+                    let height = preview_auto_tile_height(
+                        self.working_area.size.h,
+                        gaps,
+                        col.tiles.len() + 1,
+                        fixed_height,
+                        auto_weight,
+                    );
+                    let y = self.working_area.loc.y
+                        + gaps
+                        + col.data[..tile_index]
+                            .iter()
+                            .map(|data| match data.height {
+                                WindowHeight::Auto { weight } => height * weight,
+                                _ => data.size.h,
+                            })
+                            .sum::<f64>()
+                        + gaps * tile_index as f64;
+                    (height, y)
+                };
+
+                let size = Size::from((width, height));
                 let loc = Point::from((self.column_x(column_index) + origin_x, y));
                 Rectangle::new(loc, size)
             }
@@ -3002,6 +3131,31 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
                 if let Some(rv) = HitType::hit_tile(tile, tile_pos, pos) {
                     return Some(rv);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Returns the window under a point once the current view animation reaches its target.
+    pub fn window_under_at_final_view(&self, pos: Point<f64, Logical>) -> Option<&W> {
+        let scale = self.scale;
+        let view_off = Point::from((-self.target_view_pos(), 0.));
+
+        for (col, col_x) in self.columns_in_render_order() {
+            let col_off = Point::from((col_x, 0.));
+
+            for (tile, tile_off, visible) in col.tiles_in_render_order() {
+                if !visible {
+                    continue;
+                }
+
+                let tile_pos = view_off + col_off + tile_off;
+                let tile_pos = tile_pos.to_physical_precise_round(scale).to_logical(scale);
+
+                if HitType::hit_tile(tile, tile_pos, pos).is_some() {
+                    return Some(tile.window());
                 }
             }
         }
@@ -4411,6 +4565,36 @@ impl<W: LayoutElement> Column<W> {
         }
     }
 
+    fn constrained_width(&self, min_width: f64, max_width: f64) -> f64 {
+        let width = if self.is_full_width {
+            ColumnWidth::Proportion(1.)
+        } else {
+            self.width
+        };
+        self.resolve_column_width(width)
+            .clamp(min_width, max_width.max(min_width))
+    }
+
+    fn target_width(&self) -> f64 {
+        match self.pending_sizing_mode() {
+            SizingMode::Fullscreen => return self.view_size.w,
+            SizingMode::Maximized => return self.parent_area.size.w,
+            SizingMode::Normal => (),
+        }
+        let min_width = self
+            .tiles
+            .iter()
+            .map(|tile| tile.min_size_nonfullscreen().w.max(1.))
+            .fold(1., f64::max);
+        let max_width = self
+            .tiles
+            .iter()
+            .map(|tile| tile.max_size_nonfullscreen().w)
+            .filter(|width| *width > 0.)
+            .fold(f64::from(i32::MAX), f64::min);
+        self.constrained_width(min_width, max_width) + self.extra_size().w
+    }
+
     fn update_tile_sizes(&mut self, animate: bool) {
         self.update_tile_sizes_with_transaction(animate, Transaction::new());
     }
@@ -4476,17 +4660,11 @@ impl<W: LayoutElement> Column<W> {
             .unwrap_or(f64::from(i32::MAX));
         let max_width = f64::max(max_width, min_width);
 
-        let width = if self.is_full_width {
-            ColumnWidth::Proportion(1.)
-        } else {
-            self.width
-        };
+        let width = self.constrained_width(min_width, max_width);
 
         let working_size = self.working_area.size;
         let extra_size = self.extra_size();
 
-        let width = self.resolve_column_width(width);
-        let width = f64::max(f64::min(width, max_width), min_width);
         let max_tile_height = working_size.h - self.options.layout.gaps * 2. - extra_size.h;
 
         // If there are multiple windows in a column, clamp the non-auto window's height according
@@ -5563,6 +5741,17 @@ fn resolve_preset_size(
         ),
         PresetSize::Fixed(width) => ResolvedSize::Window(f64::from(width)),
     }
+}
+
+fn preview_auto_tile_height(
+    working_height: f64,
+    gaps: f64,
+    tile_count: usize,
+    fixed_height: f64,
+    total_auto_weight: f64,
+) -> f64 {
+    let height = working_height - gaps * (tile_count + 1) as f64 - fixed_height;
+    (height / total_auto_weight).max(1.)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use std::cell::{Cell, OnceCell, RefCell};
 
-use niri_config::utils::{Flag, MergeWith as _};
+use niri_config::utils::Flag;
 use niri_config::workspace::WorkspaceName;
 use niri_config::{
     CenterFocusedColumn, FloatOrInt, OutputName, Struts, TabIndicatorLength, TabIndicatorPosition,
@@ -15,6 +15,8 @@ use super::*;
 
 mod animations;
 mod fullscreen;
+mod overview_camera;
+mod overview_mapping;
 
 impl<W: LayoutElement> Default for Layout<W> {
     fn default() -> Self {
@@ -28,6 +30,8 @@ struct TestWindowInner {
     parent_id: Cell<Option<usize>>,
     bbox: Cell<Rectangle<i32, Logical>>,
     initial_bbox: Rectangle<i32, Logical>,
+    input_region: Cell<bool>,
+    buffer_loc: Cell<Point<i32, Logical>>,
     requested_size: Cell<Option<Size<i32, Logical>>>,
     // Emulates the window ignoring the compositor-provided size.
     forced_size: Cell<Option<Size<i32, Logical>>>,
@@ -93,6 +97,8 @@ impl TestWindow {
             animate_next_configure: Cell::new(false),
             animation_snapshot: RefCell::new(None),
             rules: params.rules.unwrap_or_default(),
+            input_region: Cell::new(false),
+            buffer_loc: Cell::new(Point::default()),
         }))
     }
 
@@ -161,11 +167,11 @@ impl LayoutElement for TestWindow {
     }
 
     fn buf_loc(&self) -> Point<i32, Logical> {
-        (0, 0).into()
+        self.0.buffer_loc.get()
     }
 
     fn is_in_input_region(&self, _point: Point<f64, Logical>) -> bool {
-        false
+        self.0.input_region.get()
     }
 
     fn request_size(
@@ -2532,6 +2538,250 @@ fn fixed_height_takes_max_non_auto_into_account() {
 }
 
 #[test]
+fn overview_hidden_empty_workspace_remains_a_drop_target() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::Communicate(1),
+        Op::Communicate(2),
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+    ]);
+    let output = layout.outputs().next().unwrap().clone();
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let empty_id = mon.workspaces.last().unwrap().id();
+    assert_eq!(mon.workspaces_with_render_geo().count(), 1);
+    assert_eq!(mon.overview_workspace_labels().count(), 1);
+    let initial = layout.window_visual_rect(&output, &2).unwrap();
+    let start = initial.loc + initial.size.to_point().upscale(0.5);
+    layout.interactive_move_begin(2, &output, start);
+    layout.interactive_move_update(&2, Point::from((200., 200.)), output.clone(), start);
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let (_, last) = mon.workspaces_with_render_geo().last().unwrap();
+    let point = Point::from((640., last.loc.y + last.size.h + 10.));
+    layout.interactive_move_update(&2, Point::default(), output.clone(), point);
+    layout.update_render_elements(Some(&output));
+    layout.interactive_move_end(&2);
+    Op::Communicate(2).apply(&mut layout);
+    Op::CompleteAnimations.apply(&mut layout);
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let destination = mon.workspaces.iter().find(|ws| ws.has_window(&2)).unwrap();
+    assert_eq!(destination.id(), empty_id);
+    assert_eq!(mon.workspaces_with_render_geo().count(), 2);
+    assert_eq!(mon.overview_workspace_labels().count(), 2);
+    assert!(!mon.workspaces.last().unwrap().has_windows());
+    layout.verify_invariants();
+}
+
+#[test]
+fn overview_with_no_windows_has_no_empty_card() {
+    let mut layout = check_ops([Op::AddOutput(1), Op::ToggleOverview, Op::CompleteAnimations]);
+    let output = layout.outputs().next().unwrap().clone();
+    let mon = layout.monitor_for_output(&output).unwrap();
+    assert_eq!(mon.workspaces_with_render_geo().count(), 0);
+    assert_eq!(
+        mon.insert_position(Point::from((640., 600.))).0,
+        InsertWorkspace::NewAt(0)
+    );
+    Op::ToggleOverview.apply(&mut layout);
+    Op::CompleteAnimations.apply(&mut layout);
+    assert_eq!(
+        layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .workspaces_with_render_geo()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn overview_workspace_drag_follows_pointer_and_settles_after_reorder() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::FocusWorkspace(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+    ]);
+    let output = layout.outputs().next().unwrap().clone();
+    let mon = layout.monitor_for_output_mut(&output).unwrap();
+    let workspace = mon.workspaces[0].id();
+    let geometries = mon.workspaces_render_geo().collect::<Vec<_>>();
+    let start_y = geometries[0].loc.y;
+    let pitch = geometries[1].loc.y - start_y;
+    assert!(mon.begin_workspace_drag(workspace, start_y));
+    mon.update_workspace_drag(workspace, start_y + pitch * 0.25);
+    let dragged = mon
+        .workspaces_with_render_geo()
+        .find(|(ws, _)| ws.id() == workspace)
+        .unwrap()
+        .1;
+    assert!((dragged.loc.y - start_y - pitch * 0.25).abs() <= 1.);
+    assert_eq!(mon.workspaces[0].id(), workspace);
+    mon.update_workspace_drag(workspace, start_y + pitch * 0.75);
+    assert_eq!(mon.workspaces[1].id(), workspace);
+    let dragged = mon
+        .workspaces_with_render_geo()
+        .find(|(ws, _)| ws.id() == workspace)
+        .unwrap()
+        .1;
+    assert!((dragged.loc.y - start_y - pitch * 0.75).abs() <= 1.);
+    mon.end_workspace_drag(workspace);
+    Op::CompleteAnimations.apply(&mut layout);
+    layout.verify_invariants();
+    let mon = layout.monitor_for_output(&output).unwrap();
+    let dragged = mon
+        .workspaces_with_render_geo()
+        .find(|(ws, _)| ws.id() == workspace)
+        .unwrap()
+        .1;
+    assert!((dragged.loc.y - start_y - pitch).abs() <= 1.);
+}
+
+#[test]
+fn overview_floating_drop_does_not_persist_animation_or_hide_window() {
+    let mut params = TestWindowParams::new(1);
+    params.is_floating = true;
+    params.bbox = Rectangle::from_size(Size::from((900, 900)));
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow { params },
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+    ]);
+    let output = layout.outputs().next().unwrap().clone();
+    let initial = layout.window_visual_rect(&output, &1).unwrap();
+    let start = initial.loc + initial.size.to_point().upscale(0.8);
+    layout.interactive_move_begin(1, &output, start);
+    layout.interactive_move_update(&1, Point::from((100., 100.)), output.clone(), start);
+    let geo = layout
+        .monitor_for_output(&output)
+        .unwrap()
+        .workspaces_render_geo()
+        .next()
+        .unwrap();
+    let point = geo.loc + Point::from((geo.size.w / 2., 10.));
+    layout.interactive_move_update(&1, Point::default(), output.clone(), point);
+    if let Some(InteractiveMoveState::Moving(move_)) = &mut layout.interactive_move {
+        move_.tile.animate_move_from(Point::from((1000., -2000.)));
+    }
+    layout.interactive_move_end(&1);
+    Op::Communicate(1).apply(&mut layout);
+    Op::CompleteAnimations.apply(&mut layout);
+    let ws = layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&1))
+        .unwrap()
+        .2;
+    let (_, placed) = ws
+        .tiles_with_ipc_layouts()
+        .find(|(tile, _)| tile.window().id() == &1)
+        .unwrap();
+    let position = placed.tile_pos_in_workspace_view.unwrap();
+    assert!(position.0 >= 0. && position.1 >= 0., "{position:?}");
+    assert!(position.0 + placed.tile_size.0 <= 1280.);
+}
+
+#[test]
+fn overview_inside_split_and_outside_insert_have_distinct_results() {
+    for (fraction, split, right) in [
+        (0.2, true, false),
+        (0.8, true, true),
+        (-0.1, false, false),
+        (1.1, false, true),
+    ] {
+        let mut layout = check_ops_with_options(
+            Options {
+                layout: niri_config::Layout {
+                    gaps: 0.,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            [
+                Op::AddOutput(1),
+                Op::AddWindow {
+                    params: TestWindowParams::new(1),
+                },
+                Op::FullscreenWindow(1),
+                Op::Communicate(1),
+                Op::AddWindow {
+                    params: TestWindowParams::new(2),
+                },
+                Op::Communicate(2),
+                Op::ToggleOverview,
+                Op::CompleteAnimations,
+            ],
+        );
+        let output = layout.outputs().next().unwrap().clone();
+        assert!(layout.interactive_move_begin(2, &output, Point::from((600., 100.))));
+        layout.interactive_move_update(
+            &2,
+            Point::from((200., 200.)),
+            output.clone(),
+            Point::from((600., 100.)),
+        );
+        Op::CompleteAnimations.apply(&mut layout);
+        let rect = layout.window_visual_rect(&output, &1).unwrap();
+        let point = Point::from((
+            rect.loc.x + fraction * rect.size.w,
+            rect.loc.y + rect.size.h / 2.,
+        ));
+        layout.interactive_move_update(&2, Point::default(), output.clone(), point);
+        layout.update_render_elements(Some(&output));
+        let position = layout
+            .monitor_for_output(&output)
+            .unwrap()
+            .insert_hint
+            .as_ref()
+            .unwrap()
+            .position;
+        assert_eq!(matches!(position, InsertPosition::SplitColumn(_, _)), split);
+        layout.interactive_move_end(&2);
+        Op::Communicate(1).apply(&mut layout);
+        Op::Communicate(2).apply(&mut layout);
+        Op::CompleteAnimations.apply(&mut layout);
+        let ws = layout
+            .workspaces()
+            .find(|(_, _, ws)| ws.has_window(&1))
+            .unwrap()
+            .2;
+        let windows = ws.windows().collect::<Vec<_>>();
+        let original = windows.iter().find(|window| window.id() == &1).unwrap();
+        assert_eq!(
+            original.size().w,
+            if split { 640 } else { 1280 },
+            "fraction {fraction}"
+        );
+        let positions = ws
+            .tiles_with_ipc_layouts()
+            .map(|(tile, layout)| {
+                (
+                    *tile.window().id(),
+                    layout.pos_in_scrolling_layout.unwrap().0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let original_col = positions.iter().find(|(id, _)| *id == 1).unwrap().1;
+        let moved_col = positions.iter().find(|(id, _)| *id == 2).unwrap().1;
+        assert_eq!(moved_col > original_col, right);
+        layout.verify_invariants();
+    }
+}
+
+
+#[test]
 fn start_interactive_move_then_remove_window() {
     let ops = [
         Op::AddOutput(1),
@@ -3384,6 +3634,7 @@ fn preset_column_width_fixed_correct_with_border() {
     let win = layout.windows().next().unwrap().1;
     assert_eq!(win.requested_size().unwrap().w, 500);
 }
+
 
 #[test]
 fn preset_column_width_reset_after_set_width() {

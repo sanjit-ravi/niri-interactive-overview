@@ -44,6 +44,7 @@ pub struct Tile<W: LayoutElement> {
     /// The border around the window.
     border: FocusRing,
 
+
     /// The focus ring around the window.
     focus_ring: FocusRing,
 
@@ -440,6 +441,7 @@ impl<W: LayoutElement> Tile<W> {
             }
         }
     }
+
 
     pub fn are_animations_ongoing(&self) -> bool {
         self.are_transitions_ongoing() || self.window.rules().baba_is_float == Some(true)
@@ -856,6 +858,14 @@ impl<W: LayoutElement> Tile<W> {
         loc += self.window_loc();
         loc += self.window.buf_loc().to_f64();
         loc
+    }
+
+    /// Whether pointer coordinates map directly to the window's live surface geometry.
+    ///
+    /// Opening and resize animations render transformed snapshots, so surface hit testing cannot
+    /// be mapped to their displayed geometry.
+    pub fn overview_input_geometry_is_live(&self) -> bool {
+        self.open_animation.is_none() && self.resize_animation.is_none()
     }
 
     /// Returns a partially-filled [`WindowLayout`].

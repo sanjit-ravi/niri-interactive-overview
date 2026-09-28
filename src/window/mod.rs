@@ -64,6 +64,7 @@ pub struct ResolvedWindowRules {
     /// Whether the window should open maximized to edges (true maximized).
     pub open_maximized_to_edges: Option<bool>,
 
+
     /// Whether the window should open fullscreen.
     pub open_fullscreen: Option<bool>,
 
@@ -119,6 +120,9 @@ pub struct ResolvedWindowRules {
 
     /// Override whether to set the Tiled xdg-toplevel state on the window.
     pub tiled_state: Option<bool>,
+
+    /// Whether the window can receive pointer input through the fit overview without activation.
+    pub overview_interactive: bool,
 
     /// Background effect configuration.
     pub background_effect: BackgroundEffect,
@@ -245,6 +249,7 @@ impl ResolvedWindowRules {
                     resolved.open_maximized_to_edges = Some(x);
                 }
 
+
                 if let Some(x) = rule.open_fullscreen {
                     resolved.open_fullscreen = Some(x);
                 }
@@ -255,6 +260,10 @@ impl ResolvedWindowRules {
 
                 if let Some(x) = rule.open_focused {
                     resolved.open_focused = Some(x);
+                }
+
+                if let Some(x) = rule.overview_interactive {
+                    resolved.overview_interactive = x;
                 }
 
                 if let Some(x) = rule.min_width {

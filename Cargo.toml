@@ -7,11 +7,11 @@ members = [
 
 [workspace.package]
 version = "26.4.0"
-description = "A scrollable-tiling Wayland compositor"
+description = "Experimental Niri derivative with mouse-first fit overview and opt-in interactive previews"
 authors = ["Ivan Molodetskikh <yalterz@gmail.com>"]
 license = "GPL-3.0-or-later"
 edition = "2021"
-repository = "https://github.com/niri-wm/niri"
+repository = "https://github.com/sanjit-ravi/niri-interactive-overview"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -70,6 +70,7 @@ clap_complete_nushell = "4.6.0"
 directories = "6.0.0"
 drm-ffi = "0.9.1"
 fastrand = "2.4.1"
+gdk-pixbuf = "0.21.5"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "io"] }
 git-version = "0.3.9"
 glam = "0.32.1"

@@ -41,10 +41,12 @@ use smithay::wayland::tablet_manager::{TabletDescriptor, TabletSeatTrait};
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::move_grab::MoveGrab;
+use self::overview_client_grab::OverviewClientGrab;
 use self::pick_color_grab::PickColorGrab;
 use self::pick_window_grab::PickWindowGrab;
 use self::resize_grab::ResizeGrab;
 use self::spatial_movement_grab::SpatialMovementGrab;
+use self::workspace_move_grab::WorkspaceMoveGrab;
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_a11y::KbMonBlock;
 use crate::layout::scrolling::ScrollDirection;
@@ -57,6 +59,7 @@ use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
 
 pub mod backend_ext;
 pub mod move_grab;
+pub mod overview_client_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
 pub mod resize_grab;
@@ -66,6 +69,7 @@ pub mod spatial_movement_grab;
 pub mod swipe_tracker;
 pub mod touch_overview_grab;
 pub mod touch_resize_grab;
+pub mod workspace_move_grab;
 
 use backend_ext::{NiriInputBackend as InputBackend, NiriInputDevice as _};
 
@@ -178,6 +182,12 @@ impl State {
             SwitchToggle { event } => self.on_switch_toggle::<I>(event),
             Special(_) => (),
         }
+
+        // Overview uses physical mouse travel as a directional controller, so keep its centered
+        // cursor invisible. Reconcile here to cover keyboard actions, hot corners, click-to-close,
+        // touch gestures, and pointer paths that temporarily mark the cursor visible.
+        self.sync_overview_mouse_camera();
+        self.sync_workspace_mouse_camera();
 
         // Don't hide overlays if consumed by a11y, so that you can use the screen reader
         // navigation keys.
@@ -651,6 +661,7 @@ impl State {
         if self.niri.is_locked() && !(allow_when_locked || allowed_when_locked(&action)) {
             return;
         }
+        OverviewClientGrab::cancel_current(self);
 
         if let Some(touch) = self.niri.seat.get_touch() {
             touch.cancel(self);
@@ -2247,15 +2258,18 @@ impl State {
             }
             Action::ToggleOverview => {
                 self.niri.layout.toggle_overview();
+                self.sync_overview_mouse_camera();
                 self.niri.queue_redraw_all();
             }
             Action::OpenOverview => {
                 if self.niri.layout.open_overview() {
+                    self.sync_overview_mouse_camera();
                     self.niri.queue_redraw_all();
                 }
             }
             Action::CloseOverview => {
                 if self.niri.layout.close_overview() {
+                    self.stop_overview_mouse_camera();
                     self.niri.queue_redraw_all();
                 }
             }
@@ -2404,6 +2418,24 @@ impl State {
         // We have an output, so we can compute the new location and focus.
         let mut new_pos = pos + event.delta();
 
+        if self.niri.layout.is_overview_open() && self.overview_uses_mouse_camera() {
+            if !self.niri.overview_mouse_camera_active {
+                self.start_overview_mouse_camera();
+            }
+            // Keep scrolling-mode navigation based on physical mouse travel rather than
+            // libinput's velocity-dependent pointer acceleration.
+            self.handle_overview_mouse_camera_motion(event.delta_unaccel());
+            return;
+        }
+        self.stop_overview_mouse_camera();
+
+        if self.niri.workspace_mouse_camera_active {
+            // This controller follows physical travel while leaving the visible grabbing cursor
+            // centered on the focused window.
+            self.handle_workspace_mouse_camera_motion(event.delta_unaccel());
+            return;
+        }
+
         // We received an event for the regular pointer, so show it now.
         self.niri.pointer_visibility = PointerVisibility::Visible;
         self.niri.tablet_cursor_location = None;
@@ -2412,7 +2444,9 @@ impl State {
         //
         // FIXME: ideally this should use the pointer focus with up-to-date global location.
         let mut pointer_confined = None;
-        if let Some(under) = &self.niri.pointer_contents.surface {
+        if let Some(under) = self.niri.pointer_contents.surface.as_ref().filter(|_| {
+            !(self.niri.layout.is_overview_open() && !self.overview_uses_mouse_camera())
+        }) {
             // No need to check if the pointer focus surface matches, because here we're checking
             // for an already-active constraint, and the constraint is deactivated when the focused
             // surface changes.
@@ -2746,6 +2780,16 @@ impl State {
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
+        // Remember the consumed press across config reloads and overview transitions.
+        // Never forward its release to a client that did not receive the press.
+        if button_state == ButtonState::Released
+            && self.niri.workspace_mouse_camera_button == Some(button_code)
+        {
+            self.niri.workspace_mouse_camera_button = None;
+            self.stop_workspace_mouse_camera();
+            return;
+        }
+
         // Ignore release events for mouse clicks that triggered a bind.
         if self.niri.suppressed_buttons.remove(&button_code) {
             return;
@@ -2798,11 +2842,136 @@ impl State {
                 };
             }
 
+            // Explicit compositor bindings take priority over the optional held controller.
+            let canvas_button = self.niri.config.borrow().overview.canvas_button;
+            if canvas_button != 0
+                && button_code == canvas_button
+                && modifiers.is_empty()
+                && !self.niri.layout.is_overview_open()
+                && !self.niri.is_locked()
+                && !self.niri.screenshot_ui.is_open()
+                && !self.niri.exit_confirm_dialog.is_open()
+                && !is_mru_open
+                && !pointer.is_grabbed()
+            {
+                self.niri.workspace_mouse_camera_button = Some(button_code);
+                self.start_workspace_mouse_camera();
+                return;
+            }
+
             // We received an event for the regular pointer, so show it now.
             self.niri.pointer_visibility = PointerVisibility::Visible;
             self.niri.tablet_cursor_location = None;
 
+            // A modified/compositor gesture supersedes a released, deferred client click.
+            if OverviewClientGrab::is_waiting(self) && !modifiers.is_empty() {
+                pointer.unset_grab(self, serial, event.time_msec());
+            }
             let is_overview_open = self.niri.layout.is_overview_open();
+
+            // Fit mode exposes a close button inside the hovered window preview.
+            if is_overview_open
+                && !self.overview_uses_mouse_camera()
+                && button == Some(MouseButton::Left)
+            {
+                let location = pointer.current_location();
+                if let Some((output, pos_within_output)) = self.niri.output_under(location) {
+                    if let Some(workspace_id) = self.niri.overview_workspace_label(output) {
+                        let start_data = PointerGrabStartData {
+                            focus: None,
+                            button: button_code,
+                            location,
+                        };
+                        let grab = WorkspaceMoveGrab::new(start_data, output.clone(), workspace_id);
+                        pointer.set_grab(self, grab, serial, Focus::Clear);
+                        self.niri.queue_redraw_all();
+                        return;
+                    }
+                    if let Some((window_id, close_button)) = self.niri.overview_close_button(output)
+                    {
+                        if close_button.contains(pos_within_output) {
+                            OverviewClientGrab::cancel_current(self);
+                            if let Some(window) = self.niri.find_window_by_id(window_id) {
+                                if let Some(toplevel) = window.toplevel() {
+                                    toplevel.send_close();
+                                }
+                            }
+                            self.niri.suppressed_buttons.insert(button_code);
+                            self.niri.queue_redraw_all();
+                            return;
+                        }
+                    }
+                }
+            }
+            // Bindings and compositor chrome retain priority over client interaction.
+            if button == Some(MouseButton::Left)
+                && !pointer.is_grabbed()
+                && !modifiers.contains(mod_key.to_modifiers())
+            {
+                if let Some(target) = self
+                    .niri
+                    .overview_preview_target(pointer.current_location())
+                {
+                    self.update_pointer_contents();
+                    OverviewClientGrab::start(
+                        self,
+                        target,
+                        &ButtonEvent {
+                            button: button_code,
+                            state: button_state,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                        modifiers.is_empty(),
+                    );
+                    return;
+                }
+                // A non-input region or a shader-only resize/open frame is not a license to
+                // fall back to single-click activation of an interactive preview.
+                if is_overview_open
+                    && !self.overview_uses_mouse_camera()
+                    && self
+                        .niri
+                        .window_under_cursor()
+                        .is_some_and(|w| w.rules().overview_interactive)
+                {
+                    self.niri.suppressed_buttons.insert(button_code);
+                    return;
+                }
+            }
+
+            // Do not run workspace selection, move, resize, or focus code during a client grab.
+            if OverviewClientGrab::is_active(self) {
+                pointer.button(
+                    self,
+                    &ButtonEvent {
+                        button: button_code,
+                        state: button_state,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+                pointer.frame(self);
+                return;
+            }
+
+            // The Overview mouse camera makes physical travel select the focused tile while the
+            // real pointer remains hidden at the output center. A center click must therefore
+            // activate that selection, not whichever Overview thumbnail happens to cover the
+            // pointer's parked position.
+            if is_overview_open
+                && self.niri.overview_mouse_camera_active
+                && button == Some(MouseButton::Left)
+            {
+                if let Some(window) = self.niri.layout.focus().map(|win| win.window.clone()) {
+                    self.niri.layout.close_overview();
+                    self.niri.layout.activate_window(&window);
+                    self.stop_overview_mouse_camera();
+                    self.niri.suppressed_buttons.insert(button_code);
+                    self.niri.queue_redraw_all();
+                }
+                return;
+            }
 
             if is_overview_open && !pointer.is_grabbed() && button == Some(MouseButton::Right) {
                 if let Some((output, ws)) = self.niri.workspace_under_cursor(true) {
@@ -2992,9 +3161,10 @@ impl State {
                 .then(|| self.niri.workspace_under_cursor(false))
                 .flatten()
             {
-                let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-
+                let ws_id = ws.id();
+                let ws_idx = self.niri.layout.find_workspace_by_id(ws_id).unwrap().0;
                 self.niri.layout.focus_output(&output);
+
                 self.niri.layout.toggle_overview_to_workspace(ws_idx);
 
                 // FIXME: granular.
@@ -3077,7 +3247,12 @@ impl State {
 
         // We should only handle scrolling in the overview if the pointer is not over a (top or
         // overlay) layer surface.
-        let should_handle_in_overview = if is_overview_open {
+        let interactive_preview = OverviewClientGrab::is_active(self)
+            || self
+                .niri
+                .overview_preview_target(pointer.current_location())
+                .is_some();
+        let should_handle_in_overview = if is_overview_open && !interactive_preview {
             // FIXME: ideally this should happen after updating the pointer contents, which happens
             // below. However, our pointer actions are supposed to act on the old surface, before
             // updating the pointer contents.
@@ -3626,6 +3801,7 @@ impl State {
                             }
                         }
                     } else if let Some((window, _)) = under.window {
+                        self.niri.layout.activate_window(&window);
                         if let Some(output) = is_overview_open.then_some(under.output).flatten() {
                             let mut workspaces = self.niri.layout.workspaces();
                             if let Some(ws_idx) = workspaces.find_map(|(_, ws_idx, ws)| {
@@ -3636,8 +3812,6 @@ impl State {
                                 self.niri.layout.toggle_overview_to_workspace(ws_idx);
                             }
                         }
-
-                        self.niri.layout.activate_window(&window);
 
                         // FIXME: granular.
                         self.niri.queue_redraw_all();

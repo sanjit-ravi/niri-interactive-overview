@@ -22,6 +22,10 @@ use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_lay
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
     self, ZwlrLayerSurfaceV1,
 };
+use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+};
 use wayland_backend::client::Backend;
 use wayland_client::globals::Global;
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
@@ -29,7 +33,9 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::protocol::wl_surface::{self, WlSurface};
 use wayland_client::{Connection, Dispatch, Proxy as _, QueueHandle};
 
@@ -51,6 +57,11 @@ pub struct State {
     pub outputs: HashMap<WlOutput, String>,
 
     pub compositor: Option<WlCompositor>,
+    pub seat: Option<WlSeat>,
+    pub pointer: Option<WlPointer>,
+    pub pointer_events: Vec<PointerEvent>,
+    pub pointer_button_serial: u32,
+    pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub xdg_wm_base: Option<XdgWmBase>,
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
@@ -58,6 +69,30 @@ pub struct State {
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointerEvent {
+    Enter {
+        surface: WlSurface,
+        x: f64,
+        y: f64,
+    },
+    Leave {
+        surface: WlSurface,
+    },
+    Motion {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: u32,
+        state: wl_pointer::ButtonState,
+    },
+    Axis {
+        axis: wl_pointer::Axis,
+        value: f64,
+    },
 }
 
 pub struct Window {
@@ -177,6 +212,11 @@ impl Client {
             globals: Vec::new(),
             outputs: HashMap::new(),
             compositor: None,
+            seat: None,
+            pointer: None,
+            pointer_events: Vec::new(),
+            pointer_button_serial: 0,
+            virtual_pointer_manager: None,
             xdg_wm_base: None,
             layer_shell: None,
             spbm: None,
@@ -241,6 +281,30 @@ impl Client {
             .unwrap()
             .0
             .clone()
+    }
+
+    pub fn create_pointer(&mut self) -> WlPointer {
+        let seat = self.state.seat.as_ref().unwrap();
+        let pointer = seat.get_pointer(&self.qh, ());
+        self.state.pointer = Some(pointer.clone());
+        pointer
+    }
+
+    pub fn clear_pointer_events(&mut self) {
+        self.state.pointer_events.clear();
+    }
+
+    pub fn create_virtual_pointer(&self, output: &WlOutput) -> ZwlrVirtualPointerV1 {
+        self.state
+            .virtual_pointer_manager
+            .as_ref()
+            .unwrap()
+            .create_virtual_pointer_with_output(
+                self.state.seat.as_ref(),
+                Some(output),
+                &self.qh,
+                (),
+            )
     }
 }
 
@@ -506,6 +570,12 @@ impl Dispatch<WlRegistry, ()> for State {
                 if interface == WlCompositor::interface().name {
                     let version = min(version, WlCompositor::interface().version);
                     state.compositor = Some(registry.bind(name, version, qh, ()));
+                } else if interface == WlSeat::interface().name {
+                    let version = min(version, WlSeat::interface().version);
+                    state.seat = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwlrVirtualPointerManagerV1::interface().name {
+                    let version = min(version, ZwlrVirtualPointerManagerV1::interface().version);
+                    state.virtual_pointer_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == XdgWmBase::interface().name {
                     let version = min(version, XdgWmBase::interface().version);
                     state.xdg_wm_base = Some(registry.bind(name, version, qh, ()));
@@ -533,6 +603,73 @@ impl Dispatch<WlRegistry, ()> for State {
             }
             wl_registry::Event::GlobalRemove { .. } => (),
             _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSeat,
+        _event: <WlSeat as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlPointer,
+        event: <WlPointer as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter {
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => state.pointer_events.push(PointerEvent::Enter {
+                surface,
+                x: surface_x,
+                y: surface_y,
+            }),
+            wl_pointer::Event::Leave { surface, .. } => {
+                state.pointer_events.push(PointerEvent::Leave { surface })
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.pointer_events.push(PointerEvent::Motion {
+                x: surface_x,
+                y: surface_y,
+            }),
+            wl_pointer::Event::Button {
+                serial,
+                button,
+                state: wayland_client::WEnum::Value(button_state),
+                ..
+            } => {
+                state.pointer_button_serial = serial;
+                state.pointer_events.push(PointerEvent::Button {
+                    button,
+                    state: button_state,
+                });
+            }
+            wl_pointer::Event::Axis {
+                axis: wayland_client::WEnum::Value(axis),
+                value,
+                ..
+            } => state
+                .pointer_events
+                .push(PointerEvent::Axis { axis, value }),
+            _ => (),
         }
     }
 }
@@ -773,5 +910,29 @@ impl Dispatch<WpViewport, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl Dispatch<ZwlrVirtualPointerManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrVirtualPointerManagerV1,
+        _event: <ZwlrVirtualPointerManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrVirtualPointerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwlrVirtualPointerV1,
+        _event: <ZwlrVirtualPointerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
     }
 }

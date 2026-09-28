@@ -66,6 +66,9 @@ impl TouchOverviewGrab {
                 // Tap to activate.
                 layout.focus_output(&self.output);
 
+                if let Some(window) = self.window.as_ref() {
+                    layout.activate_window(window);
+                }
                 // Activate the workspace if necessary.
                 if self.window.is_some() || self.workspace_matched_narrow {
                     // When activating a window, we want to activate the window's current
@@ -92,10 +95,6 @@ impl TouchOverviewGrab {
                     if let Some(ws_idx) = ws_idx {
                         layout.toggle_overview_to_workspace(ws_idx);
                     }
-                }
-
-                if let Some(window) = self.window.as_ref() {
-                    layout.activate_window(window);
                 }
             }
             GestureState::ViewOffset => {
