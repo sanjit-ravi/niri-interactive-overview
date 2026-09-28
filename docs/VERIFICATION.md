@@ -50,7 +50,7 @@ A main-desktop trial would require an explicitly authorized logout/login or comp
 
 ## Fresh GitHub clone — 2026-09-28
 
-Cloned the private GitHub repository at `01897cd455f892d116274d0c8d1088f235871271` into a new temporary directory. Authentication was required only because the release candidate is still private. Used a new, empty `CARGO_HOME` and the clone's own new `target` directory, not the workstation's Cargo cache or active compositor build.
+Cloned the private GitHub repository at `01897cd455f892d116274d0c8d1088f235871271` into a new temporary directory. Authentication was required only because the release candidate was private at the time. Used a new, empty `CARGO_HOME` and the clone's own new `target` directory, not the workstation's Cargo cache or active compositor build.
 
 The README's locked release build, example validation, 37 focused overview tests, configuration suite, broader non-visual workspace suite and 1,000-case seeded randomized layout command all passed again. The fresh executable reported `niri 26.04 (01897cd4)`. No missing local source files or dependencies were encountered; system development libraries were already installed on the test workstation.
 
@@ -61,3 +61,9 @@ The clone contains no tracked symlinks or Git alternate-object store. Source sca
 [GitHub Actions run 36464597004](https://github.com/sanjit-ravi/niri-interactive-overview/actions/runs/36464597004) passed for packaged candidate `01897cd455f892d116274d0c8d1088f235871271` on the Ubuntu 24.04 runner with the workflow's stable Rust toolchain. Native dependency installation, locked compositor build, example validation, test compilation, focused protocol/geometry tests, broader non-visual tests and bounded randomized checks all completed successfully.
 
 This establishes an independent build/test environment, not Ubuntu desktop or hardware interaction compatibility. The subsequent verification-notes commit changes documentation only; source and workflow remain the versions exercised by this run and the cold clone.
+
+## Public release — 2026-09-28
+
+After explicit owner approval, the repository was made public. Before publication, all 22 Wayland client/virtual-pointer interaction tests passed again, including the regression that moves an opted-in preview to another workspace with Super+left-drag while keeping overview open and sending no button events to the client. Ordinary left-drag remains application interaction; opting in does not remove compositor preview dragging.
+
+A fresh HTTPS clone succeeded with Git credential helpers and global/system Git configuration disabled and terminal authentication prompts prohibited. This verifies anonymous public source access. No compositor source changes or main-desktop deployment accompanied publication; the actual-Spotify and physical-input verification limits above remain unchanged.
