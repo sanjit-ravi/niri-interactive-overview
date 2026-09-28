@@ -561,18 +561,24 @@ fn canvas_controller_is_opt_in_and_does_not_steal_desktop_back_clicks() {
     f.niri_complete_animations();
     let output = f.niri_output(1);
     let window = server_window(&f, &surface);
-    let rect = f.niri().layout.window_visual_rect(&output, &window).unwrap();
+    let rect = f
+        .niri()
+        .layout
+        .window_visual_rect(&output, &window)
+        .unwrap();
     move_pointer(&mut f, id, &pointer, rect.loc + Point::from((100., 100.)));
     button(&mut f, id, &pointer, 275, ButtonState::Pressed);
     button(&mut f, id, &pointer, 275, ButtonState::Released);
-    assert_eq!(buttons(&f, id), [(275, ButtonState::Pressed), (275, ButtonState::Released)]);
+    assert_eq!(
+        buttons(&f, id),
+        [(275, ButtonState::Pressed), (275, ButtonState::Released)]
+    );
     assert!(!f.niri().workspace_mouse_camera_active);
 }
 
 #[test]
 fn canvas_controller_remaps_navigates_and_drains_release_after_config_change() {
-    let (mut f, id, _, pointer) =
-        fixture((1920, 1080), "overview { canvas-button 276; }");
+    let (mut f, id, _, pointer) = fixture((1920, 1080), "overview { canvas-button 276; }");
     f.niri_state().do_action(Action::CloseOverview, false);
     f.niri_complete_animations();
     let workspace = f.niri().layout.active_workspace().unwrap().id();
@@ -606,45 +612,70 @@ fn configured_button_binding_takes_priority_over_canvas_controller() {
 
 // Popup-specific dispatch keeps these protocol probes isolated from normal test windows.
 mod popup_probe {
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use super::super::client;
     use smithay::reexports::wayland_protocols::xdg::shell::client::{
-        xdg_popup::{self, XdgPopup}, xdg_positioner::XdgPositioner,
+        xdg_popup::{self, XdgPopup},
+        xdg_positioner::XdgPositioner,
         xdg_surface::{self, XdgSurface},
     };
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use wayland_client::{Connection, Dispatch, QueueHandle};
-    use super::super::client;
 
     pub struct PopupData(pub Arc<AtomicBool>);
     pub struct SurfaceData;
     pub struct PositionerData;
 
     impl Dispatch<XdgPopup, PopupData> for client::State {
-        fn event(_: &mut Self, _: &XdgPopup, event: xdg_popup::Event, data: &PopupData,
-                 _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            _: &mut Self,
+            _: &XdgPopup,
+            event: xdg_popup::Event,
+            data: &PopupData,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             if let xdg_popup::Event::PopupDone = event {
                 data.0.store(true, Ordering::Relaxed);
             }
         }
     }
     impl Dispatch<XdgSurface, SurfaceData> for client::State {
-        fn event(_: &mut Self, surface: &XdgSurface, event: xdg_surface::Event, _: &SurfaceData,
-                 _: &Connection, _: &QueueHandle<Self>) {
+        fn event(
+            _: &mut Self,
+            surface: &XdgSurface,
+            event: xdg_surface::Event,
+            _: &SurfaceData,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
             if let xdg_surface::Event::Configure { serial } = event {
                 surface.ack_configure(serial);
             }
         }
     }
     impl Dispatch<XdgPositioner, PositionerData> for client::State {
-        fn event(_: &mut Self, _: &XdgPositioner,
-                 _: <XdgPositioner as wayland_client::Proxy>::Event, _: &PositionerData,
-                 _: &Connection, _: &QueueHandle<Self>) {}
+        fn event(
+            _: &mut Self,
+            _: &XdgPositioner,
+            _: <XdgPositioner as wayland_client::Proxy>::Event,
+            _: &PositionerData,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
     }
 }
 
 #[test]
 fn grabbed_popup_is_dismissed_without_replacing_preview_drag_or_keyboard_focus() {
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     use popup_probe::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     let (mut f, id, surface, pointer) = fixture((1920, 1080), "");
     let p = point(&f, &surface);
     move_pointer(&mut f, id, &pointer, p);
@@ -655,13 +686,28 @@ fn grabbed_popup_is_dismissed_without_replacing_preview_drag_or_keyboard_focus()
     let client = f.client(id);
     let qh = client.qh.clone();
     let wm = client.state.xdg_wm_base.as_ref().unwrap();
-    let popup_surface = client.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let popup_surface = client
+        .state
+        .compositor
+        .as_ref()
+        .unwrap()
+        .create_surface(&qh, ());
     let xdg_surface = wm.get_xdg_surface(&popup_surface, &qh, SurfaceData);
     let positioner = wm.create_positioner(&qh, PositionerData);
     positioner.set_size(100, 100);
     positioner.set_anchor_rect(10, 10, 20, 20);
-    let parent = client.state.windows.iter().find(|w| w.surface == surface).unwrap();
-    let popup = xdg_surface.get_popup(Some(&parent.xdg_surface), &positioner, &qh, PopupData(done.clone()));
+    let parent = client
+        .state
+        .windows
+        .iter()
+        .find(|w| w.surface == surface)
+        .unwrap();
+    let popup = xdg_surface.get_popup(
+        Some(&parent.xdg_surface),
+        &positioner,
+        &qh,
+        PopupData(done.clone()),
+    );
     let serial = client.state.pointer_button_serial;
     assert_ne!(serial, 0);
     popup.grab(client.state.seat.as_ref().unwrap(), serial);
@@ -670,12 +716,77 @@ fn grabbed_popup_is_dismissed_without_replacing_preview_drag_or_keyboard_focus()
     assert!(done.load(Ordering::Relaxed));
     assert!(f.niri().popup_grab.is_none());
     assert!(crate::input::overview_client_grab::OverviewClientGrab::is_active(f.niri_state()));
-    assert_eq!(f.niri().seat.get_keyboard().unwrap().current_focus(), keyboard_focus);
+    assert_eq!(
+        f.niri().seat.get_keyboard().unwrap().current_focus(),
+        keyboard_focus
+    );
     button(&mut f, id, &pointer, LEFT, ButtonState::Released);
-    assert_eq!(buttons(&f, id), [(LEFT, ButtonState::Pressed), (LEFT, ButtonState::Released)]);
+    assert_eq!(
+        buttons(&f, id),
+        [(LEFT, ButtonState::Pressed), (LEFT, ButtonState::Released)]
+    );
     popup.destroy();
     xdg_surface.destroy();
     popup_surface.destroy();
     positioner.destroy();
     f.double_roundtrip(id);
+}
+
+#[test]
+fn canvas_controller_stops_at_overview_and_modal_ownership_boundaries() {
+    for action in [Action::OpenOverview, Action::Quit(false)] {
+        let (mut f, id, _, pointer) = fixture((1920, 1080), "overview { canvas-button 275; }");
+        f.niri_state().do_action(Action::CloseOverview, false);
+        f.niri_complete_animations();
+        let workspace = f.niri().layout.active_workspace().unwrap().id();
+        button(&mut f, id, &pointer, 275, ButtonState::Pressed);
+        assert!(f.niri().workspace_mouse_camera_active);
+        f.niri_state().do_action(action, false);
+        f.niri_state().sync_workspace_mouse_camera();
+        if f.niri().layout.is_overview_open() {
+            assert!(f.niri().pointer_visibility.is_visible());
+        }
+        pointer.motion(time(), 0., 200.);
+        pointer.frame();
+        f.double_roundtrip(id);
+        assert_eq!(f.niri().layout.active_workspace().unwrap().id(), workspace);
+        assert!(!f.niri().workspace_mouse_camera_active);
+        button(&mut f, id, &pointer, 275, ButtonState::Released);
+        assert_eq!(buttons(&f, id), []);
+    }
+}
+
+#[test]
+fn cancelled_preview_grab_drains_secondary_release_after_modified_press() {
+    use smithay::backend::input::{KeyState, Keycode};
+    use smithay::input::keyboard::FilterResult;
+    use smithay::utils::SERIAL_COUNTER;
+    let (mut f, id, surface, pointer) = fixture((1920, 1080), "");
+    let p = point(&f, &surface);
+    move_pointer(&mut f, id, &pointer, p);
+    click(&mut f, id, &pointer);
+    button(&mut f, id, &pointer, 0x111, ButtonState::Pressed);
+    let keyboard = f.niri().seat.get_keyboard().unwrap();
+    keyboard.input::<(), _>(
+        f.niri_state(),
+        Keycode::new(133),
+        KeyState::Pressed,
+        SERIAL_COUNTER.next_serial(),
+        time(),
+        |_, _, _| FilterResult::Forward,
+    );
+    button(&mut f, id, &pointer, 275, ButtonState::Pressed);
+    move_pointer(&mut f, id, &pointer, p + Point::from((1., 0.)));
+    button(&mut f, id, &pointer, 0x111, ButtonState::Released);
+    button(&mut f, id, &pointer, 275, ButtonState::Released);
+    keyboard.input::<(), _>(
+        f.niri_state(),
+        Keycode::new(133),
+        KeyState::Released,
+        SERIAL_COUNTER.next_serial(),
+        time(),
+        |_, _, _| FilterResult::Forward,
+    );
+    assert_eq!(buttons(&f, id), []);
+    assert!(!f.niri().seat.get_pointer().unwrap().is_grabbed());
 }

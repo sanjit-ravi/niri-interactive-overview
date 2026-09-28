@@ -232,7 +232,7 @@ impl OverviewClientGrab {
             .with_grab(|_, grab| {
                 grab.as_any()
                     .downcast_ref::<Self>()
-                    .is_some_and(|g| !g.down)
+                    .is_some_and(|g| g.phase == Phase::Waiting && !g.down)
             })
             .unwrap_or(false)
     }

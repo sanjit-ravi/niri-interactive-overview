@@ -1248,12 +1248,14 @@ impl State {
             let target_window = self.niri.workspace_mouse_camera_target_window.take();
             let pointer_reached_new_window =
                 hovered_window.is_some() && hovered_window.as_ref() != origin_window.as_ref();
-            let recenter = moved_horizontally && !pointer_reached_new_window && !overview_open;
+            let recenter = moved_horizontally
+                && !pointer_reached_new_window
+                && self.workspace_mouse_camera_available();
 
             self.niri.workspace_mouse_camera_active = false;
             self.niri.workspace_mouse_camera_accum = Point::default();
             self.niri.workspace_mouse_camera_recenter_on_release = false;
-            self.niri.pointer_visibility = if overview_open {
+            self.niri.pointer_visibility = if overview_open && self.overview_uses_mouse_camera() {
                 PointerVisibility::Hidden
             } else {
                 PointerVisibility::Visible
@@ -1282,9 +1284,20 @@ impl State {
         }
     }
 
+    pub(crate) fn workspace_mouse_camera_available(&self) -> bool {
+        !self.niri.layout.is_overview_open()
+            && !self.niri.is_locked()
+            && !self.niri.screenshot_ui.is_open()
+            && !self.niri.exit_confirm_dialog.is_open()
+            && !self.niri.window_mru_ui.is_open()
+            && !self.niri.seat.get_pointer().unwrap().is_grabbed()
+    }
+
     pub fn sync_workspace_mouse_camera(&mut self) {
-        let overview_open = self.niri.layout.is_overview_open();
-        if overview_open {
+        if !self.workspace_mouse_camera_available() {
+            // A new input owner cancels navigation, but the original button release is
+            // still ours to drain. Do not recenter or reactivate a window behind a modal.
+            self.stop_workspace_mouse_camera();
             self.niri.workspace_preview.hide();
         } else if self.niri.workspace_mouse_camera_active {
             if let Some(output) = self.niri.layout.active_output().cloned() {

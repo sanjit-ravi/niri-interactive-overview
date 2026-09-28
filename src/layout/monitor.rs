@@ -1782,6 +1782,9 @@ impl<W: LayoutElement> Monitor<W> {
         // leave an independent workspace-switch animation running underneath it.
         if !open {
             self.workspace_switch = None;
+            // Cancelling the switch also owns its completion-time cleanup. Otherwise an
+            // interrupted gesture can leave an empty workspace stranded between populated ones.
+            self.clean_up_workspaces();
         }
     }
 

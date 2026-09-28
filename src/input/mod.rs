@@ -2409,6 +2409,9 @@ impl State {
             return;
         }
 
+        // Reconcile before consuming this event, not just at the end of input dispatch.
+        self.sync_workspace_mouse_camera();
+
         let serial = SERIAL_COUNTER.next_serial();
 
         let pointer = self.niri.seat.get_pointer().unwrap();
@@ -2847,12 +2850,7 @@ impl State {
             if canvas_button != 0
                 && button_code == canvas_button
                 && modifiers.is_empty()
-                && !self.niri.layout.is_overview_open()
-                && !self.niri.is_locked()
-                && !self.niri.screenshot_ui.is_open()
-                && !self.niri.exit_confirm_dialog.is_open()
-                && !is_mru_open
-                && !pointer.is_grabbed()
+                && self.workspace_mouse_camera_available()
             {
                 self.niri.workspace_mouse_camera_button = Some(button_code);
                 self.start_workspace_mouse_camera();

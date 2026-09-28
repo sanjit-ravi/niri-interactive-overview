@@ -10,6 +10,19 @@ const QUARTER_PROGRESS: f64 = (OVERVIEW_ANIMATION_MS / 4) as f64 / OVERVIEW_ANIM
 const POSITION_EPSILON: f64 = 2.;
 const ZOOM_EPSILON: f64 = 1e-6;
 
+#[test]
+fn fit_overview_interrupted_gesture_cleans_up_cancelled_workspace_switch() {
+    let layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddWindow { params: TestWindowParams::new(1) },
+        Op::MoveWindowToWorkspace { window_id: None, workspace_idx: 1 },
+        Op::OverviewGestureBegin,
+        Op::ToggleOverview,
+    ]);
+    assert_eq!(layout.workspaces().count(), 2);
+    assert!(layout.active_workspace().unwrap().has_window(&1));
+}
+
 fn layout_with_three_populated_workspaces() -> Layout<TestWindow> {
     check_ops_with_options(
         Options::default(),
