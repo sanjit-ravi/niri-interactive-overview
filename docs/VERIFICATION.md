@@ -47,3 +47,17 @@ All task-owned client/compositor process groups were stopped; their IPC/Wayland 
 - The upstream GTK visual-test application, a full slow/property stress campaign, distribution packaging installs, Nix builds or RPM builds.
 
 A main-desktop trial would require an explicitly authorized logout/login or compositor replacement. Configuration reload cannot load a different executable. These unverified areas are not represented as passing tests.
+
+## Fresh GitHub clone — 2026-09-28
+
+Cloned the private GitHub repository at `01897cd455f892d116274d0c8d1088f235871271` into a new temporary directory. Authentication was required only because the release candidate is still private. Used a new, empty `CARGO_HOME` and the clone's own new `target` directory, not the workstation's Cargo cache or active compositor build.
+
+The README's locked release build, example validation, 37 focused overview tests, configuration suite, broader non-visual workspace suite and 1,000-case seeded randomized layout command all passed again. The fresh executable reported `niri 26.04 (01897cd4)`. No missing local source files or dependencies were encountered; system development libraries were already installed on the test workstation.
+
+The clone contains no tracked symlinks or Git alternate-object store. Source scans found no private checkout/home paths, private repository references, private-network addresses or recognizable credential patterns. Public repository ownership and upstream author/license attribution remain intentionally present. These scans are evidence of the inspected source, not a guarantee against every possible secret format.
+
+## Independent hosted CI — 2026-09-28
+
+[GitHub Actions run 36464597004](https://github.com/sanjit-ravi/niri-interactive-overview/actions/runs/36464597004) passed for packaged candidate `01897cd455f892d116274d0c8d1088f235871271` on the Ubuntu 24.04 runner with the workflow's stable Rust toolchain. Native dependency installation, locked compositor build, example validation, test compilation, focused protocol/geometry tests, broader non-visual tests and bounded randomized checks all completed successfully.
+
+This establishes an independent build/test environment, not Ubuntu desktop or hardware interaction compatibility. The subsequent verification-notes commit changes documentation only; source and workflow remain the versions exercised by this run and the cold clone.
