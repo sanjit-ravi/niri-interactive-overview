@@ -1,0 +1,24 @@
+// Standalone example: no shell, local includes, monitor names, or autostart commands.
+input {
+    mod-key "Super"
+    mod-key-nested "Super"
+}
+hotkey-overlay { skip-at-startup; }
+overview {
+    mode "fit"
+    // Linux evdev BTN_SIDE (MouseBack). Use 276 for BTN_EXTRA (MouseForward).
+    // Set 0 or omit this option to leave all buttons to normal dispatch.
+    canvas-button 275
+}
+binds {
+    Super+Tab repeat=false { toggle-overview; }
+    MouseForward repeat=false { toggle-overview; }
+    Super+Shift+E { quit; }
+    Super+Page_Down { focus-workspace-down; }
+    Super+Page_Up { focus-workspace-up; }
+}
+// Optional: uncomment only for applications you want to control inside previews.
+// window-rule {
+//     match app-id=r#"^spotify$"#
+//     overview-interactive true
+// }

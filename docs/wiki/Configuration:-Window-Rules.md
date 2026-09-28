@@ -50,6 +50,7 @@ window-rule {
     open-focused false
 
     // Properties that apply continuously.
+    overview-interactive true
     draw-border-with-background false
     opacity 0.5
     block-out-from "screencast"
@@ -125,6 +126,10 @@ window-rule {
     max-height 300
 }
 ```
+
+### `overview-interactive`
+
+**Independent derivative extension, not an upstream Niri option.** `overview-interactive` allows the matched window to receive pointer input while it is shown in the fit overview, without focusing or activating it. It defaults to `false`. Use `match app-id=...` to restrict this to clients that are safe to interact with in the overview. See the [interactive-preview interaction and safety contract](../../README.md#interactive-previews) for delayed clicks, double-click activation, dragging, popup limits and animation behavior.
 
 ### Window Matching
 

@@ -25,6 +25,7 @@
         {
           lib,
           cairo,
+          gdk-pixbuf,
           dbus,
           libGL,
           libdisplay-info,
@@ -85,6 +86,7 @@
           buildInputs =
             [
               cairo
+              gdk-pixbuf
               dbus
               libGL
               libdisplay-info

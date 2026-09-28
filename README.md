@@ -1,133 +1,182 @@
-<h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
-<p align="center">A scrollable-tiling Wayland compositor.</p>
-<p align="center">
-    <a href="https://matrix.to/#/#niri:matrix.org"><img alt="Matrix" src="https://img.shields.io/badge/matrix-%23niri-blue?logo=matrix"></a>
-    <a href="https://github.com/niri-wm/niri/blob/main/LICENSE"><img alt="GitHub License" src="https://img.shields.io/github/license/niri-wm/niri"></a>
-    <a href="https://github.com/niri-wm/niri/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/niri-wm/niri?logo=github"></a>
-</p>
+# Niri Interactive Overview
 
-<p align="center">
-    <a href="https://niri-wm.github.io/niri/Getting-Started.html">Getting Started</a> | <a href="https://niri-wm.github.io/niri/Configuration%3A-Introduction.html">Configuration</a> | <a href="https://github.com/niri-wm/niri/discussions/325">Setup&nbsp;Showcase</a>
-</p>
+An experimental, independent [Niri](https://github.com/niri-wm/niri) derivative with a mouse-first **fit overview** and optional **interactive application previews**. This is a complete compositor fork, not a Quickshell widget or a configuration bundle.
 
-<img width="1280" height="720" alt="niri with a few windows open" src="https://github.com/user-attachments/assets/dea5909e-1859-4aaa-9d88-d37f9663e00b" />
+Based on **Niri v26.04**, commit **`8ed0da44d974c32c6877d2f4630c314da0717ecb`**. It is not an official Niri release and is not endorsed by upstream.
 
-## About
+## Demo
 
-Windows are arranged in columns on an infinite strip going to the right.
-Opening a new window never causes existing windows to resize.
+A recorded interaction demo is not included yet. The intended demonstration sequence is:
 
-Every monitor has its own separate window strip.
-Windows can never "overflow" onto an adjacent monitor.
+1. Mouse side button → fit overview.
+2. Navigate populated workspaces and window columns.
+3. Drag a window between workspaces; drag a numbered badge to reorder workspaces.
+4. Use an opted-in Spotify preview without leaving overview.
+5. Double-click the preview → enter the real window.
 
-Workspaces are dynamic and arranged vertically.
-Every monitor has an independent set of workspaces, and there's always one empty workspace present all the way down.
-
-The workspace arrangement is preserved across disconnecting and connecting monitors where it makes sense.
-When a monitor disconnects, its workspaces will move to another monitor, but upon reconnection they will move back to the original monitor.
+Only synthetic or explicitly reviewed content should appear in future recordings. Physical mouse operation and actual Spotify playback/seek/volume are not established by automated protocol tests.
 
 ## Features
 
-- Built from the ground up for scrollable tiling
-- [Dynamic workspaces](https://niri-wm.github.io/niri/Workspaces.html) like in GNOME
-- An [Overview](https://github.com/user-attachments/assets/379a5d1f-acdb-4c11-b36c-e85fd91f0995) that zooms out workspaces and windows
-- Built-in screenshot UI
-- Monitor and window screencasting through xdg-desktop-portal-gnome
-    - You can [block out](https://niri-wm.github.io/niri/Configuration%3A-Window-Rules.html#block-out-from) sensitive windows from screencasts
-    - [Dynamic cast target](https://niri-wm.github.io/niri/Screencasting.html#dynamic-screencast-target) that can change what it shows on the go
-- [Touchpad](https://github.com/niri-wm/niri/assets/1794388/946a910e-9bec-4cd1-a923-4a9421707515) and [mouse](https://github.com/niri-wm/niri/assets/1794388/8464e65d-4bf2-44fa-8c8e-5883355bd000) gestures
-- Group windows into [tabs](https://niri-wm.github.io/niri/Tabs.html)
-- Configurable layout: gaps, borders, struts, window sizes
-- [Gradient borders](https://niri-wm.github.io/niri/Configuration%3A-Layout.html#gradients) with Oklab and Oklch support
-- [Background blur](https://niri-wm.github.io/niri/Window-Effects.html) for windows and layer-shell surfaces
-- [Animations](https://github.com/niri-wm/niri/assets/1794388/ce178da2-af9e-4c51-876f-8709c241d95e) with support for [custom shaders](https://github.com/niri-wm/niri/assets/1794388/27a238d6-0a22-4692-b794-30dc7a626fad)
-- Live-reloading config
-- Works with [screen readers](https://niri-wm.github.io/niri/Accessibility.html)
+- **Fit overview:** populated workspaces and their complete column strips fit on the output. The trailing unnamed empty workspace is hidden but remains a drop target below the last visible workspace.
+- **Pointer-first navigation:** select a window or workspace badge; drag windows between workspaces, into columns, or into an explicit side split. Drag a badge to reorder its workspace with animated neighbor movement and settling.
+- **Close controls:** a hovered preview exposes a trash control that takes priority over client interaction.
+- **Animated camera:** fixed-endpoint 133 ms linear fit transitions interpolate position and scale together. Newly populated previews fade in; interrupted transitions continue from displayed geometry. Window activation and horizontal focus scrolling share the closing zoom.
+- **Held canvas controller:** an optional, configurable mouse button turns physical mouse travel into inverted desktop navigation outside overview. Right/left reveals the left/right column; down/up reveals the workspace above/below. A generic workspace map and grabbing cursor indicate the held state.
+- **Interactive previews, opt-in:** send pointer hover, wheel events and client drags to selected applications while keeping overview open. Ordinary applications retain compositor selection/dragging.
+- **Alternative controller:** `overview { mode "scrolling"; }` selects the cursorless centered scrolling overview; interactive preview input is isolated to fit mode.
 
-## Video Demo
+The feature implementation is native Rust/Smithay compositor code. It does not call DMS, Quickshell, a shell script, or a desktop-specific IPC service. A bar or shell is optional; this project does not provide a complete desktop shell.
 
-https://github.com/niri-wm/niri/assets/1794388/bce834b0-f205-434e-a027-b373495f9729
+## Build
 
-Also check out this video from Brodie Robertson that showcases a lot of the niri functionality: [Niri Is My New Favorite Wayland Compositor](https://youtu.be/DeYx2exm04M)
+Use current stable Rust, Cargo, Git, a C compiler, Clang/libclang and pkg-config. Keep `Cargo.lock`: builds use `--locked`. Cargo downloads public crates and the pinned public Smithay revision; no private repository or local source checkout is needed.
 
-## Status
+Arch-family dependencies (package names, not a claim of testing every Arch derivative):
 
-Niri is stable for day-to-day use and does most things expected of a Wayland compositor.
-Many people are daily-driving niri, and are happy to help in our [Matrix channel].
+```sh
+sudo pacman -S --needed base-devel clang git rust wayland libinput libxkbcommon mesa libglvnd libseat systemd dbus pipewire pango cairo gdk-pixbuf2 libdisplay-info
+```
 
-Give it a try!
-Follow the instructions on the [Getting Started](https://niri-wm.github.io/niri/Getting-Started.html) page.
-Grab a desktop shell like [DankMaterialShell] or [Noctalia] (or build a more traditional setup): niri by itself is not a complete desktop environment.
-Also check out [awesome-niri], a list of niri-related links and projects.
+Ubuntu 24.04 / CI dependency recipe:
 
-Here are some points you may have questions about:
+```sh
+sudo apt-get update
+sudo apt-get install -y git curl build-essential pkg-config clang libudev-dev libgbm-dev libxkbcommon-dev libegl1-mesa-dev libwayland-dev libinput-dev libdbus-1-dev libsystemd-dev libseat-dev libpipewire-0.3-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libdisplay-info-dev
+```
 
-- **Multi-monitor**: yes, a core part of the design from the very start. Mixed DPI works.
-- **Fractional scaling**: yes, plus all niri UI stays pixel-perfect.
-- **NVIDIA**: seems to work fine.
-- **Floating windows**: yes, starting from niri 25.01.
-- **Input devices**: niri supports tablets, touchpads, and touchscreens.
-You can map the tablet to a specific monitor, or use [OpenTabletDriver].
-We have touchpad gestures, but no touchscreen gestures yet.
-- **Wlr protocols**: yes, we have most of the important ones like layer-shell, gamma-control, screencopy.
-You can check on [wayland.app](https://wayland.app) at the bottom of each protocol's page.
-- **Performance**: while I run niri on beefy machines, I try to stay conscious of performance.
-I've seen someone use it fine on an Eee PC 900 from 2008, of all things.
-- **Xwayland**: [integrated](https://niri-wm.github.io/niri/Xwayland.html#using-xwayland-satellite) via xwayland-satellite starting from niri 25.08.
+Install current stable Rust using your package manager or [rustup](https://rustup.rs/) if the distribution's Rust is too old. Then:
 
-## Media
+```sh
+git clone https://github.com/sanjit-ravi/niri-interactive-overview.git
+cd niri-interactive-overview
+cargo build --release --locked
+./target/release/niri validate --config resources/interactive-overview.kdl
+```
 
-[niri: Making a Wayland compositor in Rust](https://youtu.be/Kmz8ODolnDg?list=PLRdS-n5seLRqrmWDQY4KDqtRMfIwU0U3T) · *December 2024*
+Do **not** use `--all-features`: upstream profiling features can collect unbounded data. The added GdkPixbuf dependency loads desktop icons for the held-controller map.
 
-My talk from the 2024 Moscow RustCon about niri, and how I do randomized property testing and profiling, and measure input latency.
-The talk is in Russian, but I prepared full English subtitles that you can find in YouTube's subtitle language selector.
+## Try without replacing stock Niri
 
-[An interview with Ivan, the developer behind Niri](https://www.trommelspeicher.de/podcast/special_the_developer_behind_niri) · *June 2025*
+From a terminal inside a Wayland desktop:
 
-An interview by a German tech podcast Das Triumvirat (in English).
-We talk about niri development and history, and my experience building and maintaining niri.
+```sh
+./target/release/niri --config resources/interactive-overview.kdl
+```
 
-[A tour of the niri scrolling-tiling Wayland compositor](https://lwn.net/Articles/1025866/) · *July 2025*
+This opens a **nested compositor window**. Do not pass `--session` in a nested run: session mode imports environment into the user's service manager. The example starts no applications or shell. The log prints this instance's Wayland display and IPC socket; launch a disposable native Wayland application with `WAYLAND_DISPLAY` set to that display. Target IPC commands using its `NIRI_SOCKET`, never your parent compositor's socket.
 
-An LWN article with a nice overview and introduction to niri.
+The example uses Super even in nested mode; the parent compositor may intercept it or side buttons. Nested mode is useful for render/development checks, not proof of physical input compatibility. Close only the nested window to return to your desktop.
 
-## Contributing
+### Optional side-by-side install
 
-If you'd like to help with niri, there are plenty of both coding- and non-coding-related ways to do so.
-See [CONTRIBUTING.md](https://github.com/niri-wm/niri/blob/main/CONTRIBUTING.md) for an overview.
+```sh
+install -Dm755 target/release/niri "$HOME/.local/bin/niri-interactive-overview"
+```
 
-## Inspiration
+Cargo still builds a binary named `niri`; this command installs it under a distinct name. It does not change `/usr/bin/niri`, system services, session entries, or your current compositor.
 
-Niri is heavily inspired by [PaperWM] which implements scrollable tiling on top of GNOME Shell.
+For a real-session trial, save your work and log out normally. From an unused TTY, run the distinct binary with a dedicated configuration:
 
-One of the reasons that prompted me to try writing my own compositor is being able to properly separate the monitors.
-Being a GNOME Shell extension, PaperWM has to work against Shell's global window coordinate space to prevent windows from overflowing.
+```sh
+~/.local/bin/niri-interactive-overview --config /absolute/path/to/interactive-overview.kdl
+```
 
-## Tile Scrollably Elsewhere
+This bare TTY launch does not install portal/session integration. Integrating a display-manager session or user service is an explicit administrator task; review upstream session documentation rather than blindly installing the inherited `resources/niri.service` or distribution packaging metadata, which still target stock binary paths.
 
-Here are some other projects which implement a similar workflow:
+## Configuration
 
-- [PaperWM]: scrollable tiling on top of GNOME Shell.
-- [karousel]: scrollable tiling on top of KDE.
-- [scroll](https://github.com/dawsers/scroll) and [papersway]: scrollable tiling on top of sway/i3.
-- Hyprland has a built-in [scrolling layout](https://wiki.hypr.land/Configuring/Scrolling-Layout/).
-- [Paneru] and [PaperWM.spoon]: scrollable tiling on top of macOS.
+[`resources/interactive-overview.kdl`](resources/interactive-overview.kdl) is a standalone minimal example, not a copy of a personal desktop configuration:
 
-## Contact
+```kdl
+input {
+    mod-key "Super"
+    mod-key-nested "Super"
+}
+overview {
+    mode "fit"
+    canvas-button 275
+}
+binds {
+    Super+Tab repeat=false { toggle-overview; }
+    MouseForward repeat=false { toggle-overview; }
+    Super+Shift+E { quit; }
+}
+```
 
-Our main communication channel is a Matrix chat, feel free to join and ask a question: https://matrix.to/#/#niri:matrix.org
+`canvas-button` is a **Linux evdev button code**, not a device name. `275` is BTN_SIDE / MouseBack, and `276` is BTN_EXTRA / MouseForward. Hardware may label or position them differently. Set `0` or omit it to disable the controller (the default). Other evdev button codes can be used; use a spare button rather than your ordinary left/right click. Change the overview toggle independently using normal Niri bindings. Explicit compositor bindings take priority when they use the same button; do not bind your canvas button to another action if you want its held behavior.
 
-We also have a community Discord server: https://discord.gg/vT8Sfjy7sx
+Canvas mode starts only on an unmodified press outside overview and outside an existing pointer grab or compositor modal UI. Opening overview, entering a modal/locked state, or starting another grab cancels navigation; the matching physical release is still consumed, including across configuration changes. Physical travel is unaccelerated and uses a 160-unit directional threshold. Horizontal release retains the cursor when it reaches a newly revealed window, otherwise it centers on the selected target to avoid focus-follows-mouse returning to the origin. Vertical changes retain output-centered cursor behavior. No shell bar is revealed at workspace boundaries.
 
-[PaperWM]: https://github.com/paperwm/PaperWM
-[waybar]: https://github.com/Alexays/Waybar
-[fuzzel]: https://codeberg.org/dnkl/fuzzel
-[awesome-niri]: https://github.com/niri-wm/awesome-niri
-[karousel]: https://github.com/peterfajdiga/karousel
-[papersway]: https://spwhitton.name/tech/code/papersway/
-[Paneru]: https://github.com/karinushka/paneru
-[PaperWM.spoon]: https://github.com/mogenson/PaperWM.spoon
-[Matrix channel]: https://matrix.to/#/#niri:matrix.org
-[OpenTabletDriver]: https://opentabletdriver.net/
-[DankMaterialShell]: https://danklinux.com/
-[Noctalia]: https://noctalia.dev/
+### Interactive previews
+
+Disabled by default. Add an explicit app-ID rule, for example:
+
+```kdl
+window-rule {
+    match app-id=r#"^spotify$"#
+    overview-interactive true
+}
+```
+
+This is generic window-rule matching, not a Spotify-only implementation. Inspect your own application's actual app ID. A later matching `overview-interactive false` overrides an earlier true rule. Unlisted applications keep normal overview single-click selection and compositor dragging.
+
+| Gesture in an opted-in fit preview | Result |
+| --- | --- |
+| Hover / wheel | Delivered to the client through the displayed preview transform |
+| Single click | Deferred, then delivered once at the saved surface and client coordinate |
+| Ordinary left-drag | Client drag; ownership continues outside the preview |
+| Super+left-drag | Move the preview itself (uses your configured compositor modifier) |
+| Double-click | Enter the real window on second release; neither click reaches the client |
+
+The double-click interval is **400 ms from the first press**, with **8 logical screen pixels** of movement tolerance. Movement at the threshold while held begins a client drag; a long hold commits at timeout. A released click can resolve early when the pointer moves beyond tolerance. A drag cannot later become an activation double-click.
+
+Preview input does **not grant keyboard focus**, switch workspace or activate the window. Enter the real window for typing. Trash, workspace badges and compositor bindings retain priority. Pending input is cancelled on compositor actions, overview closure, target/surface destruction or invalid geometry; delivered presses are balanced and physical releases drained.
+
+**Popup limits:** grabbed native XDG popup menus are dismissed in fit overview rather than taking keyboard focus. Subsurfaces and non-grabbing popups use normal surface-tree hit testing inside the tile input region; popup regions outside the tile are not interactive.
+
+**Animation limits:** camera/positional animations use currently displayed transforms, including the window's buffer-origin offset. Opening/resize shaders can show snapshots without a uniquely invertible live surface; those intervals reject preview input and cancel pending grabs. XWayland applications and unusual client input protocols require separate testing.
+
+## Tests
+
+Run these from the checkout built above:
+
+```sh
+cargo test --release --locked overview --no-run
+timeout --kill-after=5s 120s cargo test --release --locked overview -- --test-threads=1
+cargo test --release --locked -p niri-config
+cargo test --release --locked --workspace --exclude niri-visual-tests --no-run
+timeout --kill-after=5s 300s cargo test --release --locked --workspace --exclude niri-visual-tests -- --test-threads=1
+RUN_SLOW_TESTS=1 PROPTEST_CASES=1000 PROPTEST_RNG_SEED=42 timeout --kill-after=5s 180s cargo test --release --locked --lib layout::tests::random_operations_dont_panic -- --exact --test-threads=1
+```
+
+Compilation is outside the execution timeout. Tests include real in-process Wayland clients and the virtual-pointer protocol, not IPC substitutes for pointer input. `niri-visual-tests` is an upstream GTK developer application, not part of the normal compositor build; it needs additional GTK/libadwaita dependencies. The final command opts into 1,000 seeded randomized layout cases. It is a bounded check, not the full upstream slow/stress campaign.
+
+See [verification notes](docs/VERIFICATION.md) for exact exercised coverage and remaining limits. CI builds the compositor, validates the example, and runs configuration, focused and broader non-visual tests.
+
+## Safety and rollback
+
+Keep stock Niri installed. Never overwrite its executable or restart your live compositor to test this fork. Before a real-session trial, preserve your stock configuration and session selection. Fork-specific `overview` settings and `overview-interactive` rules may fail validation in stock Niri: use your original stock configuration when returning.
+
+To roll back, close the nested instance, or log out of the experimental session and choose your original stock session. The side-by-side install alone needs no service rollback. Restore only service overrides that you explicitly changed yourself. A compositor restart disconnects graphical applications; configuration reload does not replace a running executable.
+
+## Architecture and maintenance
+
+- `src/layout/overview_camera.rs`, `monitor.rs`: fit endpoints, workspace positioning, transitions and reorder geometry.
+- `src/layout/{mod,workspace,scrolling,tile}.rs`: preview hit testing, inverse transforms, insertion/drop geometry and activation interpolation.
+- `src/ui/overview_controls.rs`: workspace badges and close controls.
+- `src/ui/workspace_preview.rs`: generic held-controller map and desktop-icon rendering.
+- `src/input/{mod,move_grab,workspace_move_grab,overview_client_grab}.rs`: dispatch priority, drag ownership, pending clicks, balancing and cancellation.
+- `src/niri.rs`, `src/handlers/{mod,xdg_shell}.rs`: pointer refresh, modal/grab guards and popup lifecycle.
+- `niri-config/src/{misc,window_rule}.rs`, `src/window/mod.rs`: overview settings and opt-in rule resolution.
+- `src/tests/overview_input.rs`, `src/layout/tests/overview_*.rs`: protocol and geometry regressions.
+
+This extraction intentionally excludes automatic single-window maximization/border policies, application-specific preview branding, monitor setup, wallpaper, shell widgets, personal launchers, media/RGB integrations and machine-specific services. Upstream source/history and general-purpose defaults remain available for reference; the dedicated example is the supported starting point for these features.
+
+Changes to Smithay pointer-grab semantics, surface coordinates, popup handling, layout insertions or animation geometry require re-running protocol and transform regressions before upgrading the base. This is a maintained-source derivative, not a promise of compatibility with arbitrary Niri versions, distributions, GPUs or mice.
+
+## Upstream relationship, contributions and license
+
+Niri was created by Ivan Molodetskikh and its contributors. Their history and licensing material are retained. Source is **GPL-3.0-or-later** as declared in Cargo metadata; [LICENSE](LICENSE) contains the GPL version 3 text. Preserve notices and provide corresponding source when distributing modified binaries.
+
+Report derivative-specific problems here, not upstream. [Upstream's contribution policy](https://github.com/niri-wm/niri/blob/main/CONTRIBUTING.md) prohibits LLM-created contributions, including issues and comments. This extraction used AI assistance and makes no claim of upstream acceptance. Do not forward generated material upstream. See [CONTRIBUTING.md](CONTRIBUTING.md) for this project's review and testing expectations.

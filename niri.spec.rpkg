@@ -75,6 +75,7 @@ BuildRequires:  pkgconfig(libdisplay-info)
 BuildRequires:  pipewire-devel
 BuildRequires:  pango-devel
 BuildRequires:  cairo-gobject-devel
+BuildRequires:  gdk-pixbuf2-devel
 # Needed for pipewire-rs
 BuildRequires:  clang
 # Needed for some tests with a surfaceless EGL renderer

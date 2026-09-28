@@ -1,45 +1,24 @@
 ---
-name: Bug report
-about: Report a bug or a crash
+name: Overview regression
+about: Report a reproducible problem in this independent derivative
 title: ''
-labels: bug
+labels: ''
 assignees: ''
-
 ---
 
-<!-- Please describe the issue here at the top, then fill in the system information below. -->
+## Expected and observed behavior
 
-<!-- Attaching your full niri config can help diagnose the problem. -->
-<details><summary>Config</summary>
+## Minimal reproduction
 
-```kdl
-insert config here
-```
+<!-- Exact gesture, fit/scrolling mode, opt-in rules; sanitized minimal configuration only. -->
 
-</details> 
+## Environment
 
-<!--
-If you have a problem with a specific app, please verify that it is running on Wayland, rather than X11. An easy way is to run xeyes and mouse over the app: xeyes will be able to "see" only X11 windows.
+- Fork commit and binary version:
+- Distribution / GPU / output scale:
+- Application ID; native Wayland or XWayland:
+- Physical device, virtual-pointer test, or nested compositor:
 
-You can also check what process the window PID belongs to:
+## Evidence
 
-$ readlink /proc/$(niri msg --json pick-window | jq .pid)/exe
-
-If this points to xwayland-satellite, then it's an X11 window.
-
-Please report issues with X11 apps to xwayland-satellite instead of niri: https://github.com/Supreeeme/xwayland-satellite/issues
--->
-
-### System Information
-
-<!-- Paste the output of `niri -V`, e.g. niri 25.02 (b94a5db) -->
-* niri version: 
-
-<!-- Write your distribution, e.g. Fedora 40 Silverblue -->
-* Distro: 
-
-<!-- Write your GPU vendor and model, e.g. AMD RX 6700M -->
-* GPU: 
-
-<!-- Write your CPU vendor and model, e.g. AMD Ryzen 7 6800H -->
-* CPU:
+<!-- Review logs and images for private content. Do not attach your full desktop configuration. -->
